@@ -23,6 +23,7 @@ use carbide_uuid::machine::MachineId;
 use errors::MachineValidationError;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 mod errors;
 mod machine_validation;
@@ -35,6 +36,10 @@ pub const MACHINE_VALIDATION_IMAGE_FILE: &str = "/tmp/machine_validation.tar";
 pub const MACHINE_VALIDATION_RUNNER_BASE_PATH: &str = "nvcr.io/nvidian/nvforge/";
 pub const MACHINE_VALIDATION_RUNNER_TAG: &str = "latest";
 pub const IMAGE_LIST_FILE: &str = "/tmp/list.json";
+
+/// When set to `1` on the scout host, allows honoring `run_unverfied_tests` on validation runs.
+/// If unset, unverified tests are never fetched or executed regardless of RPC flags.
+pub const FORGE_MV_ALLOW_UNVERIFIED_TESTS: &str = "FORGE_MV_ALLOW_UNVERIFIED_TESTS";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MachineValidationOptions {
@@ -54,6 +59,16 @@ pub struct MachineValidationFilter {
     pub allowed_tests: Vec<String>,
     pub run_unverfied_tests: Option<bool>,
     pub contexts: Option<Vec<String>>,
+}
+
+/// Bundles options for [`MachineValidation::run`](crate::MachineValidation::run) (keeps Clippy happy and call sites readable).
+#[derive(Debug, Clone)]
+pub struct MachineValidationRunParams {
+    pub context: String,
+    pub uuid: String,
+    pub execute_tests_sequentially: bool,
+    pub filter: MachineValidationFilter,
+    pub bypass_unverified_tests: bool,
 }
 
 pub struct MachineValidationManager {}
@@ -113,6 +128,25 @@ impl MachineValidationManager {
     ) -> Result<(), MachineValidationError> {
         let mc = MachineValidation { options };
 
+        let allow_unverified = std::env::var(FORGE_MV_ALLOW_UNVERIFIED_TESTS)
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let run_unverified_requested = machine_validation_filter
+            .run_unverfied_tests
+            .unwrap_or(false);
+        let bypass_verified_filter = allow_unverified && run_unverified_requested;
+        if run_unverified_requested && !allow_unverified {
+            warn!(
+                "run_unverfied_tests was requested but {} is not set to 1; only verified tests will run",
+                FORGE_MV_ALLOW_UNVERIFIED_TESTS
+            );
+        }
+        if bypass_verified_filter {
+            warn!(
+                "Running with unverified machine validation tests enabled ({FORGE_MV_ALLOW_UNVERIFIED_TESTS}=1)"
+            );
+        }
+
         let tests = mc
             .clone()
             .get_machine_validation_tests(rpc::forge::MachineValidationTestsGetRequest {
@@ -131,11 +165,8 @@ impl MachineValidationManager {
                         .unwrap_or_default()
                 },
                 is_enabled: Some(true),
-                verified: if machine_validation_filter
-                    .run_unverfied_tests
-                    .unwrap_or(false)
-                {
-                    None // This indicates run all tests including un verified
+                verified: if bypass_verified_filter {
+                    None // run all tests including unverified
                 } else {
                     Some(true)
                 },
@@ -151,6 +182,9 @@ impl MachineValidationManager {
         };
         let mut expected_time_duration = 0;
         for test in tests.clone() {
+            if !bypass_verified_filter && !test.verified {
+                continue;
+            }
             if !machine_validation_filter.allowed_tests.is_empty()
                 && !machine_validation_filter
                     .allowed_tests
@@ -172,10 +206,13 @@ impl MachineValidationManager {
         mc.run(
             machine_id,
             tests,
-            context,
-            uuid,
-            true,
-            machine_validation_filter,
+            MachineValidationRunParams {
+                context,
+                uuid,
+                execute_tests_sequentially: true,
+                filter: machine_validation_filter,
+                bypass_unverified_tests: bypass_verified_filter,
+            },
         )
         .await?;
 

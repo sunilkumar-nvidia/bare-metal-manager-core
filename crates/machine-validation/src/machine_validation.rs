@@ -25,17 +25,144 @@ use forge_tls::client_config::ClientCert;
 use rpc::forge_tls_client;
 use rpc::forge_tls_client::{ApiConfig, ForgeClientConfig};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use utils::cmd::TokioCmd;
 
 use crate::{
     IMAGE_LIST_FILE, MACHINE_VALIDATION_IMAGE_FILE, MACHINE_VALIDATION_IMAGE_PATH,
     MACHINE_VALIDATION_RUNNER_BASE_PATH, MACHINE_VALIDATION_RUNNER_TAG, MACHINE_VALIDATION_SERVER,
-    MachineValidation, MachineValidationError, MachineValidationFilter, MachineValidationManager,
+    MachineValidation, MachineValidationError, MachineValidationManager, MachineValidationRunParams,
     SCHME,
 };
 pub const MAX_STRING_STD_SIZE: usize = 1024 * 1024; // 1MB in bytes;
 pub const DEFAULT_TIMEOUT: u64 = 3600;
+
+/// Split `args` the way a shell would for word boundaries, without invoking a shell.
+fn split_test_args(args: &str) -> Vec<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        shlex::split(trimmed).unwrap_or_else(|| vec![args.to_string()])
+    }
+}
+
+/// Extra `ctr run` flags from DB must be individual long options only (`--a` or `--a=b`), no shell metacharacters.
+fn parse_container_arg_tokens(container_arg: &str) -> Result<Vec<String>, String> {
+    let s = container_arg.trim();
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    if s.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '|' | '&' | '#' | '`' | '$' | '\n' | '\r' | '"' | '\'' | '(' | ')'
+        )
+    }) {
+        return Err(
+            "container_arg contains disallowed characters (shell/runtime injection risk)"
+                .to_string(),
+        );
+    }
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    for tok in &tokens {
+        let body = tok.strip_prefix("--").ok_or_else(|| {
+            "each container_arg token must be one ctr long flag (--name or --name=value)"
+                .to_string()
+        })?;
+        if body.is_empty() {
+            return Err("empty flag in container_arg".to_string());
+        }
+        if let Some((name, val)) = body.split_once('=') {
+            if name.is_empty() || val.is_empty() {
+                return Err("invalid --name=value in container_arg".to_string());
+            }
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err("invalid flag name in container_arg".to_string());
+            }
+        } else if !body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("invalid flag in container_arg".to_string());
+        }
+    }
+    Ok(tokens.iter().map(|t| (*t).to_string()).collect())
+}
+
+fn validate_image_ref(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("img_name is empty".to_string());
+    }
+    if name.chars().any(|ch| {
+        ch.is_control()
+            || matches!(
+                ch,
+                ';' | '|' | '&' | '#' | '`' | '$' | '"' | '\'' | ' ' | '\t'
+            )
+    }) {
+        return Err("img_name contains disallowed characters".to_string());
+    }
+    Ok(())
+}
+
+/// Interpreter basenames we refuse as the test program (blocks `bash -c`, `sh -c`, `env bash -c`, …).
+const DENIED_PROGRAM_BASENAMES: &[&str] =
+    &["sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish"];
+
+fn program_basename(program: &str) -> String {
+    Path::new(program.trim())
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| program.trim())
+        .to_ascii_lowercase()
+}
+
+fn is_denied_shell_basename(name: &str) -> bool {
+    DENIED_PROGRAM_BASENAMES.contains(&name)
+}
+
+/// Rejects empty command, direct shell interpreters, and `env <shell> …` (common `-c` injection bypass).
+fn validate_test_invocation(command: &str, args: &[String]) -> Result<(), String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("command is empty".to_string());
+    }
+    let base = program_basename(trimmed);
+    if is_denied_shell_basename(&base) {
+        return Err(
+            "command cannot be a shell interpreter (sh/bash/…); use a direct binary and argv"
+                .to_string(),
+        );
+    }
+    if base == "env" && let Some(first) = args.first() {
+        let b = program_basename(first);
+        if is_denied_shell_basename(&b) {
+            return Err(
+                "cannot invoke a shell via env; use a direct binary and argv".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validation_timeout_secs(timeout: Option<i64>) -> u64 {
+    const DEFAULT: u64 = 7200;
+    const MAX: u64 = 86400 * 14; // 14 days cap
+    let Some(t) = timeout else {
+        return DEFAULT;
+    };
+    if t <= 0 {
+        return DEFAULT;
+    }
+    match u64::try_from(t) {
+        Ok(secs) => secs.min(MAX),
+        Err(_) => DEFAULT,
+    }
+}
 
 impl MachineValidation {
     pub(crate) async fn get_container_auth_config(self) -> Result<(), MachineValidationError> {
@@ -194,10 +321,12 @@ impl MachineValidation {
         tracing::info!(url);
         MachineValidationManager::download_file(&url, MACHINE_VALIDATION_IMAGE_FILE).await?;
 
-        let command_string = format!(" ctr images import {MACHINE_VALIDATION_IMAGE_FILE}");
-        info!("Executing command '{}'", command_string);
-        TokioCmd::new("sh")
-            .args(vec!["-c".to_string(), command_string])
+        info!(
+            "Executing ctr images import {}",
+            MACHINE_VALIDATION_IMAGE_FILE
+        );
+        TokioCmd::new("ctr")
+            .args(["images", "import", MACHINE_VALIDATION_IMAGE_FILE])
             .timeout(DEFAULT_TIMEOUT)
             .output_with_timeout()
             .await
@@ -209,16 +338,14 @@ impl MachineValidation {
 
     pub async fn pull_container(image_name: &str) {
         tracing::info!(image_name);
-        let command_string = format!(" nerdctl -n default pull {image_name}");
-        tracing::info!(command_string);
-        match TokioCmd::new("sh")
-            .args(vec!["-c".to_string(), command_string])
+        match TokioCmd::new("nerdctl")
+            .args(["-n", "default", "pull", image_name])
             .timeout(DEFAULT_TIMEOUT)
             .output_with_timeout()
             .await
         {
             Ok(result) => info!("pulled: {}", result.stdout),
-            Err(e) => error!("Failed to image pull{} '{}'", image_name, e),
+            Err(e) => error!("Failed to image pull '{}' {}", image_name, e),
         }
     }
     async fn execute_machinevalidation_command(
@@ -255,7 +382,25 @@ impl MachineValidation {
 
         // Check pre_condition
         if test.pre_condition.is_some() {
-            match TokioCmd::new(test.pre_condition.clone().unwrap_or("/bin/true".to_owned()))
+            let pre = test.pre_condition.clone().unwrap_or("/bin/true".to_owned());
+            let pre_trim = pre.trim();
+            if pre_trim.is_empty() {
+                mc_result.start_time = Some(Utc::now().into());
+                mc_result.end_time = Some(Utc::now().into());
+                mc_result.std_err = "pre_condition is empty".to_owned();
+                mc_result.std_out = "Skipped : Pre condition failed".to_owned();
+                mc_result.exit_code = 0;
+                return Some(mc_result);
+            }
+            if is_denied_shell_basename(&program_basename(pre_trim)) {
+                mc_result.start_time = Some(Utc::now().into());
+                mc_result.end_time = Some(Utc::now().into());
+                mc_result.std_err = "pre_condition cannot be a shell interpreter".to_owned();
+                mc_result.std_out = "Skipped : Pre condition failed".to_owned();
+                mc_result.exit_code = 0;
+                return Some(mc_result);
+            }
+            match TokioCmd::new(pre)
                 .timeout(DEFAULT_TIMEOUT)
                 .env("CONTEXT".to_owned(), in_context.clone())
                 .env("MACHINE_VALIDATION_RUN_ID".to_owned(), uuid.to_string())
@@ -284,26 +429,17 @@ impl MachineValidation {
                 }
             }
         }
-        // Execute command
-        let mut command_string = format!("{} {}", test.command, test.args);
-        // Check if container
-        if test.img_name.is_some() {
-            if test.execute_in_host.unwrap_or(false) {
-                // Execute command in host
-                command_string = format!("chroot /host /bin/bash -c \"{command_string}\"");
-            }
-            Self::pull_container(&test.img_name.clone().unwrap_or_default()).await;
-            let ctr_arg = test.container_arg.clone().unwrap_or("".to_string());
-            command_string = format!(
-                "ctr run --rm --privileged --no-pivot \
-                --mount type=bind,src=/,dst=/host,options=rbind:rw {} \
-                {} runner {}",
-                ctr_arg,
-                test.img_name.clone().unwrap_or_default(),
-                command_string
-            );
-        };
-        info!("Executing command '{}'", command_string);
+        // Execute command without a shell (argv only).
+        let inner_args = split_test_args(&test.args);
+        if let Err(e) = validate_test_invocation(&test.command, &inner_args) {
+            mc_result.start_time = Some(Utc::now().into());
+            mc_result.end_time = Some(Utc::now().into());
+            mc_result.std_err = e.clone();
+            mc_result.std_out = format!("Skipped: invalid command: {e}");
+            mc_result.exit_code = 0;
+            return Some(mc_result);
+        }
+        let timeout_secs = validation_timeout_secs(test.timeout);
 
         let _ = std::fs::remove_file("/tmp/forge_env_variables");
         match File::create("/tmp/forge_env_variables") {
@@ -322,15 +458,70 @@ impl MachineValidation {
             Err(_) => error!("Failed to create file"),
         }
 
-        match TokioCmd::new("sh")
-            .args(vec!["-c".to_string(), command_string])
-            .timeout(test.timeout.unwrap_or(7200).try_into().unwrap())
-            .env("CONTEXT".to_owned(), in_context.clone())
-            .env("MACHINE_VALIDATION_RUN_ID".to_owned(), uuid.to_string())
-            .env("MACHINE_ID".to_owned(), machine_id.to_string())
-            .output_with_timeout()
-            .await
-        {
+        let cmd_output = if let Some(ref img) = test.img_name {
+            if let Err(e) = validate_image_ref(img) {
+                mc_result.start_time = Some(Utc::now().into());
+                mc_result.end_time = Some(Utc::now().into());
+                mc_result.std_err = e.clone();
+                mc_result.std_out = format!("Skipped: invalid img_name: {e}");
+                mc_result.exit_code = 0;
+                return Some(mc_result);
+            }
+            let ctr_extra =
+                match parse_container_arg_tokens(test.container_arg.as_deref().unwrap_or("")) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        mc_result.start_time = Some(Utc::now().into());
+                        mc_result.end_time = Some(Utc::now().into());
+                        mc_result.std_err = e.clone();
+                        mc_result.std_out = format!("Skipped: invalid container_arg: {e}");
+                        mc_result.exit_code = 0;
+                        return Some(mc_result);
+                    }
+                };
+            Self::pull_container(img).await;
+            let mut argv: Vec<String> = vec![
+                "run".into(),
+                "--rm".into(),
+                "--privileged".into(),
+                "--no-pivot".into(),
+                "--mount".into(),
+                "type=bind,src=/,dst=/host,options=rbind:rw".into(),
+            ];
+            argv.extend(ctr_extra);
+            argv.push(img.clone());
+            argv.push("runner".into());
+            if test.execute_in_host.unwrap_or(false) {
+                argv.push("chroot".into());
+                argv.push("/host".into());
+                argv.push(test.command.clone());
+                argv.extend(inner_args);
+            } else {
+                argv.push(test.command.clone());
+                argv.extend(inner_args);
+            }
+            info!("Executing ctr {}", argv.join(" "));
+            TokioCmd::new("ctr")
+                .args(argv)
+                .timeout(timeout_secs)
+                .env("CONTEXT".to_owned(), in_context.clone())
+                .env("MACHINE_VALIDATION_RUN_ID".to_owned(), uuid.to_string())
+                .env("MACHINE_ID".to_owned(), machine_id.to_string())
+                .output_with_timeout()
+                .await
+        } else {
+            info!("Executing {} {}", test.command, inner_args.join(" "));
+            TokioCmd::new(&test.command)
+                .args(inner_args)
+                .timeout(timeout_secs)
+                .env("CONTEXT".to_owned(), in_context.clone())
+                .env("MACHINE_VALIDATION_RUN_ID".to_owned(), uuid.to_string())
+                .env("MACHINE_ID".to_owned(), machine_id.to_string())
+                .output_with_timeout()
+                .await
+        };
+
+        match cmd_output {
             Ok(result) => {
                 let mut stdout_str = result.stdout;
                 let mut stderr_str = result.stderr;
@@ -405,11 +596,16 @@ impl MachineValidation {
         self,
         machine_id: &MachineId,
         tests: Vec<rpc::forge::MachineValidationTest>,
-        context: String,
-        uuid: String,
-        execute_tests_sequentially: bool,
-        machine_validation_filter: MachineValidationFilter,
+        params: MachineValidationRunParams,
     ) -> Result<(), MachineValidationError> {
+        let MachineValidationRunParams {
+            context,
+            uuid,
+            execute_tests_sequentially,
+            filter: machine_validation_filter,
+            bypass_unverified_tests,
+        } = params;
+
         self.clone().get_container_auth_config().await?;
         match Self::get_container_images().await {
             Ok(_) => info!("Successfully fetched container images"),
@@ -417,6 +613,13 @@ impl MachineValidation {
         }
         if execute_tests_sequentially {
             for test in tests {
+                if !bypass_unverified_tests && !test.verified {
+                    warn!(
+                        test_id = %test.test_id,
+                        "Skipping unverified machine validation test (defense in depth)"
+                    );
+                    continue;
+                }
                 if !machine_validation_filter.allowed_tests.is_empty()
                     && !machine_validation_filter
                         .allowed_tests
@@ -430,7 +633,7 @@ impl MachineValidation {
                     .execute_machinevalidation_command(
                         machine_id,
                         &test,
-                        context.to_string(),
+                        context.clone(),
                         rpc::common::Uuid {
                             value: uuid.clone(),
                         },

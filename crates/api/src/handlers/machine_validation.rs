@@ -512,21 +512,24 @@ pub(crate) async fn update_machine_validation_test(
     let req = request.into_inner();
     let mut txn = api.txn_begin().await?;
 
-    // let existing = machine_validation_suites::find(
-    //     &mut txn,
-    //     rpc::MachineValidationTestsGetRequest {
-    //         test_id: Some(req.test_id.clone()),
-    //         version: Some(req.version.clone()),
-    //         ..rpc::MachineValidationTestsGetRequest::default()
-    //     },
-    // )
-    // .await
-    // .map_err(CarbideError::from)?;
-    // if existing[0].read_only {
-    //     return Err(Status::invalid_argument(
-    //         "Cannot modify read-only test cases",
-    //     ));
-    // }
+    let existing = machine_validation_suites::find(
+        &mut txn,
+        ModelTestsGetRequest {
+            test_id: Some(req.test_id.clone()),
+            version: Some(req.version.clone()),
+            ..ModelTestsGetRequest::default()
+        },
+    )
+    .await
+    .map_err(CarbideError::from)?;
+    let Some(row) = existing.first() else {
+        return Err(Status::not_found("Machine validation test not found"));
+    };
+    if row.read_only {
+        return Err(Status::invalid_argument(
+            "Cannot modify read-only test cases",
+        ));
+    }
     let model_req: ModelTestUpdateRequest = req.clone().into();
     let test_id = machine_validation_suites::update(&mut txn, model_req).await?;
 
