@@ -18,11 +18,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use ::rpc::forge as rpc;
+use carbide_network::ip::{IdentifyAddressFamily, IpAddressFamily};
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::rack::RackId;
 use db::dhcp_entry::DhcpEntry;
 use db::{self, expected_machine, machine_interface};
-use forge_network::ip::{IdentifyAddressFamily, IpAddressFamily};
 use mac_address::MacAddress;
 use model::dpa_interface::DpaInterface;
 use model::expected_machine::ExpectedHostNic;
@@ -138,7 +138,7 @@ async fn handle_dhcp_from_dpa(
         return Ok(None);
     }
 
-    let mut dpa_ifs = db::dpa_interface::find_by_mac_addr(txn, &macaddr).await?;
+    let mut dpa_ifs = db::dpa_interface::find_by_mac_addr(&mut *txn, &macaddr).await?;
 
     if dpa_ifs.len() != 1 {
         // If the MAC address does not belong to any DPA object, len will be 0.

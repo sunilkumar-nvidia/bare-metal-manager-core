@@ -29,6 +29,7 @@ use sqlx::{FromRow, Row};
 
 use crate::StateSla;
 use crate::controller_outcome::PersistentStateHandlerOutcome;
+use crate::machine::health_override::HealthReportOverrides;
 
 #[derive(Debug, Clone)]
 pub struct Rack {
@@ -36,6 +37,7 @@ pub struct Rack {
     pub config: RackConfig,
     pub controller_state: Versioned<RackState>,
     pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
+    pub health_report_overrides: HealthReportOverrides,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     pub deleted: Option<DateTime<Utc>>,
@@ -43,6 +45,17 @@ pub struct Rack {
 
 impl From<Rack> for rpc::forge::Rack {
     fn from(value: Rack) -> Self {
+        let health = derive_rack_aggregate_health(&value.health_report_overrides);
+        let health_overrides = value
+            .health_report_overrides
+            .clone()
+            .into_iter()
+            .map(|(hr, m)| rpc::forge::HealthOverrideOrigin {
+                mode: m as i32,
+                source: hr.source,
+            })
+            .collect();
+
         rpc::forge::Rack {
             id: Some(value.id),
             rack_state: value.controller_state.value.to_string(),
@@ -58,14 +71,33 @@ impl From<Rack> for rpc::forge::Rack {
                 .iter()
                 .map(|x| x.to_string())
                 .collect(),
-            expected_nvlink_switches: vec![],
+            expected_nvlink_switches: value
+                .config
+                .expected_switches
+                .iter()
+                .map(|x| x.to_string())
+                .collect(),
             compute_trays: value.config.compute_trays,
             power_shelves: value.config.power_shelves,
             created: Some(Timestamp::from(value.created)),
             updated: Some(Timestamp::from(value.updated)),
             deleted: value.deleted.map(Timestamp::from),
+            health: Some(health.into()),
+            health_overrides,
         }
     }
+}
+
+fn derive_rack_aggregate_health(overrides: &HealthReportOverrides) -> health_report::HealthReport {
+    if let Some(replace) = &overrides.replace {
+        return replace.clone();
+    }
+    let mut output = health_report::HealthReport::empty("rack-aggregate-health".to_string());
+    for report in overrides.merges.values() {
+        output.merge(report);
+    }
+    output.observed_at = Some(chrono::Utc::now());
+    output
 }
 
 impl<'r> FromRow<'r, PgRow> for Rack {
@@ -74,6 +106,10 @@ impl<'r> FromRow<'r, PgRow> for Rack {
         let controller_state: sqlx::types::Json<RackState> = row.try_get("controller_state")?;
         let controller_state_outcome: Option<sqlx::types::Json<PersistentStateHandlerOutcome>> =
             row.try_get("controller_state_outcome").ok();
+        let health_report_overrides: HealthReportOverrides = row
+            .try_get::<sqlx::types::Json<HealthReportOverrides>, _>("health_report_overrides")
+            .map(|j| j.0)
+            .unwrap_or_default();
         Ok(Rack {
             id: row.try_get("id")?,
             config: config.0,
@@ -82,6 +118,7 @@ impl<'r> FromRow<'r, PgRow> for Rack {
                 version: row.try_get("controller_state_version")?,
             },
             controller_state_outcome: controller_state_outcome.map(|o| o.0),
+            health_report_overrides,
             created: row.try_get("created")?,
             updated: row.try_get("updated")?,
             deleted: row.try_get("deleted")?,
@@ -213,15 +250,26 @@ pub struct RackStateHistory {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RackConfig {
     pub compute_trays: Vec<MachineId>,
-    // todo: put in nvlink switch ids here when that code lands
-    // pub nvlink_switches: Vec<NvlinkSwitchId>
     pub power_shelves: Vec<PowerShelfId>,
 
-    // store bmc mac address of every tray in the rack
+    /// expected_compute_trays contains the BMC MAC addresses of every
+    /// expected compute tray in the rack.
     pub expected_compute_trays: Vec<MacAddress>,
-    // todo: nvlink switches
-    // pub expected_nvlink_switches: Vec<MacAddress>,
+    /// expected_switches contains the BMC MAC addresses of every expected
+    /// switch in the rack. The NVOS management MAC address is stored
+    /// separately in the expected switch's metadata labels, and validated
+    /// separately as part of the switch state controller.
+    #[serde(default)]
+    pub expected_switches: Vec<MacAddress>,
+    /// expected_power_shelves contains the BMC MAC addresses of every
+    /// expected power shelf in the rack.
     pub expected_power_shelves: Vec<MacAddress>,
+
+    /// rack_type is the name of the rack type (e.g. "NVL72") that maps to
+    /// a RackCapabilitiesSet in the config file. The capabilities are looked
+    /// up at runtime so config changes apply retroactively to all racks.
+    #[serde(default)]
+    pub rack_type: Option<String>,
 }
 
 pub fn state_sla(state: &RackState, state_version: &ConfigVersion) -> StateSla {

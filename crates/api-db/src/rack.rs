@@ -17,6 +17,7 @@
 
 use carbide_uuid::rack::RackId;
 use config_version::ConfigVersion;
+use health_report::{HealthReport, OverrideMode};
 use mac_address::MacAddress;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::rack::{Rack, RackConfig, RackState};
@@ -63,9 +64,13 @@ pub async fn get(txn: impl DbReader<'_>, rack_id: RackId) -> DatabaseResult<Rack
     let query = "SELECT * from racks l WHERE l.id=$1".to_string();
     sqlx::query_as(&query)
         .bind(rack_id)
-        .fetch_one(txn)
+        .fetch_optional(txn)
         .await
-        .map_err(|e| DatabaseError::new("racks get", e))
+        .map_err(|e| DatabaseError::new("racks get", e))?
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "rack",
+            id: rack_id.to_string(),
+        })
 }
 
 pub async fn create(
@@ -75,17 +80,13 @@ pub async fn create(
     expected_nvlink_switches: Vec<MacAddress>,
     expected_power_shelves: Vec<MacAddress>,
 ) -> DatabaseResult<Rack> {
-    if !expected_nvlink_switches.is_empty() {
-        return Err(DatabaseError::new(
-            "nvlink switch todo",
-            sqlx::error::Error::ColumnNotFound("nvlink_switch".to_string()),
-        ));
-    }
     let config = RackConfig {
         compute_trays: Vec::new(),
         power_shelves: Vec::new(),
         expected_compute_trays,
+        expected_switches: expected_nvlink_switches,
         expected_power_shelves,
+        rack_type: None,
     };
     let controller_state = String::from("{\"state\":\"expected\"}");
     let controller_state_outcome = String::from("{}");
@@ -118,6 +119,72 @@ pub async fn update(
         .map_err(|e| DatabaseError::new(query, e))?;
 
     Ok(rack)
+}
+
+/// adopt_expected_switch adopts an expected switch into a rack's config by
+/// adding its BMC MAC address to expected_switches. Returns Ok(false) if
+/// the rack does not exist (the switch is not adopted).
+pub async fn adopt_expected_switch(
+    txn: &mut PgConnection,
+    rack_id: RackId,
+    bmc_mac_address: MacAddress,
+) -> DatabaseResult<bool> {
+    match get(&mut *txn, rack_id).await {
+        Ok(rack) => {
+            let mut config = rack.config.clone();
+            if !config.expected_switches.contains(&bmc_mac_address) {
+                config.expected_switches.push(bmc_mac_address);
+                update(&mut *txn, rack_id, &config).await?;
+            }
+            Ok(true)
+        }
+        Err(DatabaseError::NotFoundError { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// adopt_expected_machine adopts an expected machine into a rack's config by
+/// adding its BMC MAC address to expected_compute_trays. Returns Ok(false) if
+/// the rack does not exist (the machine is not adopted).
+pub async fn adopt_expected_machine(
+    txn: &mut PgConnection,
+    rack_id: RackId,
+    bmc_mac_address: MacAddress,
+) -> DatabaseResult<bool> {
+    match get(&mut *txn, rack_id).await {
+        Ok(rack) => {
+            let mut config = rack.config.clone();
+            if !config.expected_compute_trays.contains(&bmc_mac_address) {
+                config.expected_compute_trays.push(bmc_mac_address);
+                update(&mut *txn, rack_id, &config).await?;
+            }
+            Ok(true)
+        }
+        Err(DatabaseError::NotFoundError { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// adopt_expected_power_shelf adopts an expected power shelf into a rack's
+/// config by adding its BMC MAC address to expected_power_shelves. Returns
+/// Ok(false) if the rack does not exist (the power shelf is not adopted).
+pub async fn adopt_expected_power_shelf(
+    txn: &mut PgConnection,
+    rack_id: RackId,
+    bmc_mac_address: MacAddress,
+) -> DatabaseResult<bool> {
+    match get(&mut *txn, rack_id).await {
+        Ok(rack) => {
+            let mut config = rack.config.clone();
+            if !config.expected_power_shelves.contains(&bmc_mac_address) {
+                config.expected_power_shelves.push(bmc_mac_address);
+                update(&mut *txn, rack_id, &config).await?;
+            }
+            Ok(true)
+        }
+        Err(DatabaseError::NotFoundError { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn try_update_controller_state(
@@ -173,6 +240,62 @@ pub async fn final_delete(txn: &mut PgConnection, rack_id: RackId) -> DatabaseRe
         .execute(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(())
+}
+
+pub async fn insert_health_report_override(
+    txn: &mut PgConnection,
+    rack_id: &RackId,
+    mode: OverrideMode,
+    health_report: &HealthReport,
+) -> Result<(), DatabaseError> {
+    let column_name = "health_report_overrides";
+    let path = match mode {
+        OverrideMode::Merge => format!("merges,\"{}\"", health_report.source),
+        OverrideMode::Replace => "replace".to_string(),
+    };
+
+    let query = format!(
+        "UPDATE racks SET {column_name} = jsonb_set(
+            coalesce({column_name}, '{{\"merges\": {{}}}}'::jsonb),
+            '{{{path}}}',
+            $1::jsonb
+        ) WHERE id = $2
+        RETURNING id"
+    );
+
+    let _id: (RackId,) = sqlx::query_as(&query)
+        .bind(sqlx::types::Json(health_report))
+        .bind(rack_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::new("insert rack health report override", e))?;
+
+    Ok(())
+}
+
+pub async fn remove_health_report_override(
+    txn: &mut PgConnection,
+    rack_id: &RackId,
+    mode: OverrideMode,
+    source: &str,
+) -> Result<(), DatabaseError> {
+    let column_name = "health_report_overrides";
+    let path = match mode {
+        OverrideMode::Merge => format!("merges,{source}"),
+        OverrideMode::Replace => "replace".to_string(),
+    };
+    let query = format!(
+        "UPDATE racks SET {column_name} = ({column_name} #- '{{{path}}}') WHERE id = $1
+            RETURNING id"
+    );
+
+    let _id: (RackId,) = sqlx::query_as(&query)
+        .bind(rack_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::new("remove rack health report override", e))?;
 
     Ok(())
 }

@@ -304,6 +304,10 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub machine_validation_config: MachineValidationConfig,
 
+    /// Machine identity (SPIFFE JWT-SVID) config. Section `[machine_identity]`.
+    #[serde(default)]
+    pub machine_identity: MachineIdentityConfig,
+
     #[serde(default)]
     pub bypass_rbac: bool,
 
@@ -409,6 +413,14 @@ pub struct CarbideConfig {
     // rms_api_url is the URL to the Rack Manager Service API.
     pub rms_api_url: Option<String>,
 
+    /// rack_types contains the rack type definitions. When expected racks
+    /// are created, they are given a rack_type name to reference. This maps
+    /// those names to the actual RackTypeConfig. This may eventually change,
+    /// and/or co-exist with a DCIM providing us an entire config as part of
+    /// the ingestion call.
+    #[serde(default)]
+    pub rack_types: model::rack_type::RackTypeConfig,
+
     /// Whether to use the host NIC instead of the DPUs on the compute trays.
     /// This is used to test the host NIC functionality.
     #[serde(
@@ -443,6 +455,11 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub arm_pxe_boot_url_override: Option<String>,
 
+    /// Controls enforcement of compute allocations when a new instance is
+    /// requested.
+    #[serde(default)]
+    pub compute_allocation_enforcement: ComputeAllocationEnforcement,
+
     /// supernic_firmware_profiles is a nested map of FirmwareFlasherProfiles
     /// keyed by part_number and PSID. Each profile specifies the firmware to
     /// flash and optional lifecycle flags (reset, verify_image, verify_version).
@@ -465,12 +482,99 @@ pub struct CarbideConfig {
     /// ```
     #[serde(default)]
     pub supernic_firmware_profiles: HashMap<String, HashMap<String, FirmwareFlasherProfile>>,
+
+    #[serde(default)]
+    pub component_manager: Option<component_manager::config::ComponentManagerConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeAllocationEnforcement {
+    #[default]
+    /// If an allocation exists, don't enforce, but log what would have happened.
+    WarnOnly,
+    /// Only enforce if allocations exist.
+    EnforceIfPresent,
+    /// Always enforce, and zero allocations for the tenant means
+    /// the new instance request will be rejected.
+    Always,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DpfConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub bfb_url: String,
+    #[serde(default)]
+    pub deployment_name: Option<String>,
+    #[serde(default)]
+    pub services: Option<Vec<DpfServiceConfig>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DpfServiceConfig {
+    pub name: String,
+    pub helm_repo_url: String,
+    pub helm_chart: String,
+    pub helm_version: String,
+}
+
+/// Machine identity (SPIFFE JWT-SVID) configuration.
+/// Loaded from `[machine_identity]` section in config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MachineIdentityConfig {
+    /// Master switch. If false, SetIdentityConfiguration and SignMachineIdentity return 503.
+    #[serde(default = "machine_identity_default_enabled")]
+    pub enabled: bool,
+    /// Signing algorithm for per-org keys (e.g. ES256).
+    #[serde(default = "machine_identity_default_algorithm")]
+    pub algorithm: String,
+    /// Min token TTL permitted in seconds.
+    #[serde(default = "machine_identity_default_token_ttl_min_sec")]
+    pub token_ttl_min_sec: u32,
+    /// Max token TTL permitted in seconds.
+    #[serde(default = "machine_identity_default_token_ttl_max_sec")]
+    pub token_ttl_max_sec: u32,
+    /// Optional HTTP proxy for token endpoint calls (SSRF mitigation).
+    #[serde(default)]
+    pub token_endpoint_http_proxy: Option<String>,
+}
+
+fn machine_identity_default_enabled() -> bool {
+    true
+}
+fn machine_identity_default_algorithm() -> String {
+    "ES256".to_string()
+}
+fn machine_identity_default_token_ttl_min_sec() -> u32 {
+    60
+}
+fn machine_identity_default_token_ttl_max_sec() -> u32 {
+    86400
+}
+
+impl Default for MachineIdentityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: machine_identity_default_enabled(),
+            algorithm: machine_identity_default_algorithm(),
+            token_ttl_min_sec: machine_identity_default_token_ttl_min_sec(),
+            token_ttl_max_sec: machine_identity_default_token_ttl_max_sec(),
+            token_endpoint_http_proxy: None,
+        }
+    }
+}
+
+impl From<MachineIdentityConfig> for model::tenant::IdentityConfigValidationBounds {
+    fn from(mi: MachineIdentityConfig) -> Self {
+        Self {
+            token_ttl_min_sec: mi.token_ttl_min_sec,
+            token_ttl_max_sec: mi.token_ttl_max_sec,
+            algorithm: mi.algorithm,
+            encryption_key_id: "placeholder-encryption-key".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -637,13 +741,14 @@ impl CarbideConfig {
         self.supernic_firmware_profiles.get(part_number)?.get(psid)
     }
 
-    // Given a device_type, return the profile that needs to be applied
-    // to configure the DPA.
-    pub fn get_dpa_profile(&self, _device_type: String) -> String {
-        // XXX TODO XXX
-        // Figure out profile that needs to be applied to the given device type
-        // XXX TODO XXX
-        "bf3-spx-enabled".to_string()
+    // get_mlxconfig_profile looks up an MlxConfigProfile by name from
+    // the mlx-config-profiles config map. Returns None if the map is
+    // not configured or the name is not found.
+    pub fn get_mlxconfig_profile(
+        &self,
+        name: &str,
+    ) -> Option<&libmlx::profile::profile::MlxConfigProfile> {
+        self.mlxconfig_profiles.as_ref()?.get(name)
     }
 
     pub fn max_concurrent_machine_updates(&self) -> MaxConcurrentUpdates {
@@ -805,6 +910,13 @@ pub struct MachineStateControllerConfig {
         serialize_with = "as_duration"
     )]
     pub scout_reporting_timeout: Duration,
+    /// How long to wait for UEFI boot to complete after rebooting a host
+    #[serde(
+        default = "MachineStateControllerConfig::uefi_boot_wait_default",
+        deserialize_with = "deserialize_duration_chrono",
+        serialize_with = "as_duration"
+    )]
+    pub uefi_boot_wait: Duration,
 }
 
 impl MachineStateControllerConfig {
@@ -827,6 +939,10 @@ impl MachineStateControllerConfig {
     fn scout_reporting_timeout_default() -> Duration {
         Duration::minutes(5)
     }
+
+    pub fn uefi_boot_wait_default() -> Duration {
+        Duration::minutes(5)
+    }
 }
 
 impl Default for MachineStateControllerConfig {
@@ -839,6 +955,7 @@ impl Default for MachineStateControllerConfig {
             dpu_up_threshold: MachineStateControllerConfig::dpu_up_threshold_default(),
             scout_reporting_timeout: MachineStateControllerConfig::scout_reporting_timeout_default(
             ),
+            uefi_boot_wait: MachineStateControllerConfig::uefi_boot_wait_default(),
         }
     }
 }
@@ -979,6 +1096,28 @@ pub struct StateControllerConfig {
         serialize_with = "as_std_duration"
     )]
     pub processor_log_interval: std::time::Duration,
+
+    /// Configures how often the state handling processor will reassess metrics and emit them.
+    /// Calculating aggregate metrics is expensive (all object metrics need to be traversed).
+    /// Therefore this should not happen much more frequently than the observabilty system
+    /// will access them.
+    #[serde(
+        default = "StateControllerConfig::metric_emission_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub metric_emission_interval: std::time::Duration,
+
+    /// Configures for how long metrics for each object managed by the state controller
+    /// will show up before they get evicted.
+    /// The duration of this needs to be longer than the time between state handler
+    /// invocations for the object
+    #[serde(
+        default = "StateControllerConfig::metric_hold_time",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub metric_hold_time: std::time::Duration,
 }
 
 impl StateControllerConfig {
@@ -998,6 +1137,14 @@ impl StateControllerConfig {
         std::time::Duration::from_secs(60)
     }
 
+    pub const fn metric_emission_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    pub const fn metric_hold_time() -> std::time::Duration {
+        std::time::Duration::from_secs(5 * 60)
+    }
+
     pub const fn max_concurrency_default() -> usize {
         10
     }
@@ -1011,6 +1158,8 @@ impl Default for StateControllerConfig {
             processor_dispatch_interval: Self::processor_dispatch_interval_default(),
             processor_log_interval: Self::processor_log_interval_default(),
             max_concurrency: Self::max_concurrency_default(),
+            metric_emission_interval: Self::metric_emission_interval(),
+            metric_hold_time: Self::metric_hold_time(),
         }
     }
 }
@@ -1023,6 +1172,8 @@ impl From<&StateControllerConfig> for IterationConfig {
             max_concurrency: config.max_concurrency,
             processor_dispatch_interval: config.processor_dispatch_interval,
             processor_log_interval: config.processor_log_interval,
+            metric_emission_interval: config.metric_emission_interval,
+            metric_hold_time: config.metric_hold_time,
         }
     }
 }
@@ -1348,6 +1499,9 @@ pub struct SiteExplorerConfig {
         serialize_with = "serialize_arc_atomic_bool"
     )]
     pub use_onboard_nic: Arc<AtomicBool>,
+    #[serde(default = "SiteExplorerConfig::default_explore_mode")]
+    /// What type of exploration to be used.
+    pub explore_mode: SiteExplorerExploreMode,
 }
 
 impl Default for SiteExplorerConfig {
@@ -1374,6 +1528,7 @@ impl Default for SiteExplorerConfig {
             switches_created_per_run: Self::default_switches_created_per_run(),
             rotate_switch_nvos_credentials: Self::default_rotate_switch_nvos_credentials(),
             use_onboard_nic: Arc::new(false.into()),
+            explore_mode: Self::default_explore_mode(),
         }
     }
 }
@@ -1447,6 +1602,20 @@ impl SiteExplorerConfig {
     pub fn default_use_onboard_nic() -> Arc<AtomicBool> {
         Arc::new(false.into())
     }
+
+    pub const fn default_explore_mode() -> SiteExplorerExploreMode {
+        SiteExplorerExploreMode::LibRedfish
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum SiteExplorerExploreMode {
+    #[serde(rename = "libredfish")]
+    LibRedfish,
+    #[serde(rename = "nv-redfish")]
+    NvRedfish,
+    #[serde(rename = "compare-result")]
+    CompareResult,
 }
 
 impl DpaConfig {
@@ -1468,6 +1637,7 @@ impl Default for DpaConfig {
             subnet_ip: Self::default_subnet_ip(),
             subnet_mask: 0,
             hb_interval: Self::default_hb_interval(),
+            auth: MqttAuthConfig::default(),
         }
     }
 }
@@ -2449,6 +2619,51 @@ fn default_mqtt_broker_port() -> u16 {
     1884
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MqttAuthMode {
+    #[default]
+    None,
+    BasicAuth,
+    Oauth2,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MqttOAuth2Config {
+    pub token_url: String,
+
+    #[serde(default)]
+    pub scopes: Vec<String>,
+
+    #[serde(
+        default = "MqttOAuth2Config::default_http_timeout",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub http_timeout: std::time::Duration,
+
+    #[serde(default = "MqttOAuth2Config::default_username")]
+    pub username: String,
+}
+
+impl MqttOAuth2Config {
+    fn default_http_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
+    fn default_username() -> String {
+        "oauth2token".to_string()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct MqttAuthConfig {
+    #[serde(default)]
+    pub auth_mode: MqttAuthMode,
+
+    pub oauth2: Option<MqttOAuth2Config>,
+}
+
 /// DPA (aka Cluster Interconnect Network) related configuration
 /// Enabled DPA, and specifies basic network settings.
 /// The VNI to be used by DPA will be the same as the parent VPC.
@@ -2481,6 +2696,9 @@ pub struct DpaConfig {
         serialize_with = "as_duration"
     )]
     pub hb_interval: chrono::TimeDelta,
+
+    #[serde(default)]
+    pub auth: MqttAuthConfig,
 }
 
 /// DSX Exchange Event Bus configuration for publishing state change events via MQTT 3.1.1.
@@ -2513,6 +2731,9 @@ pub struct DsxExchangeEventBusConfig {
     /// Events are dropped if the queue is full. Defaults to 1024.
     #[serde(default = "DsxExchangeEventBusConfig::default_queue_capacity")]
     pub queue_capacity: usize,
+
+    #[serde(default)]
+    pub auth: MqttAuthConfig,
 }
 
 impl DsxExchangeEventBusConfig {
@@ -2694,12 +2915,15 @@ mod tests {
                 max_concurrency: 10,
                 processor_dispatch_interval: std::time::Duration::from_secs(2),
                 processor_log_interval: std::time::Duration::from_secs(60),
+                metric_emission_interval: std::time::Duration::from_secs(60),
+                metric_hold_time: std::time::Duration::from_secs(5 * 60),
             },
             dpu_wait_time: Duration::minutes(20),
             power_down_wait: Duration::seconds(10),
             failure_retry_time: Duration::minutes(90),
             dpu_up_threshold: Duration::weeks(1),
             scout_reporting_timeout: Duration::minutes(5),
+            uefi_boot_wait: Duration::minutes(5),
         };
 
         let config_str = serde_json::to_string(&input).unwrap();
@@ -2733,6 +2957,8 @@ mod tests {
                         max_concurrency: 13,
                         processor_dispatch_interval: std::time::Duration::from_secs(2),
                         processor_log_interval: std::time::Duration::from_secs(60),
+                        metric_emission_interval: std::time::Duration::from_secs(60),
+                        metric_hold_time: std::time::Duration::from_secs(5 * 60),
                     }
                 },
                 dpu_wait_time: Duration::minutes(20),
@@ -2740,6 +2966,7 @@ mod tests {
                 failure_retry_time: Duration::minutes(90),
                 dpu_up_threshold: Duration::weeks(1),
                 scout_reporting_timeout: Duration::minutes(5),
+                uefi_boot_wait: Duration::minutes(5),
             }
         );
     }
@@ -2759,6 +2986,7 @@ mod tests {
                 failure_retry_time: Duration::minutes(90),
                 dpu_up_threshold: Duration::weeks(1),
                 scout_reporting_timeout: Duration::minutes(5),
+                uefi_boot_wait: Duration::minutes(5),
             }
         );
     }
@@ -2779,6 +3007,8 @@ mod tests {
                         max_concurrency: 13,
                         processor_dispatch_interval: std::time::Duration::from_secs(2),
                         processor_log_interval: std::time::Duration::from_secs(60),
+                        metric_emission_interval: std::time::Duration::from_secs(60),
+                        metric_hold_time: std::time::Duration::from_secs(5 * 60),
                     }
                 },
                 network_segment_drain_time: Duration::minutes(21),
@@ -2800,7 +3030,7 @@ mod tests {
         let config_str = serde_json::to_string(&input).unwrap();
         assert_eq!(
             config_str,
-            r#"{"iteration_time":"30s","max_object_handling_time":"180s","max_concurrency":10,"processor_dispatch_interval":"2s","processor_log_interval":"60s"}"#
+            r#"{"iteration_time":"30s","max_object_handling_time":"180s","max_concurrency":10,"processor_dispatch_interval":"2s","processor_log_interval":"60s","metric_emission_interval":"60s","metric_hold_time":"300s"}"#
         );
         let config: StateControllerConfig = serde_json::from_str(&config_str).unwrap();
         assert_eq!(config, input);
@@ -2814,11 +3044,13 @@ mod tests {
             max_concurrency: 33,
             processor_dispatch_interval: std::time::Duration::from_secs(2),
             processor_log_interval: std::time::Duration::from_secs(60),
+            metric_emission_interval: std::time::Duration::from_secs(60),
+            metric_hold_time: std::time::Duration::from_secs(5 * 60),
         };
         let config_str = serde_json::to_string(&input).unwrap();
         assert_eq!(
             config_str,
-            r#"{"iteration_time":"11s","max_object_handling_time":"22s","max_concurrency":33,"processor_dispatch_interval":"2s","processor_log_interval":"60s"}"#
+            r#"{"iteration_time":"11s","max_object_handling_time":"22s","max_concurrency":33,"processor_dispatch_interval":"2s","processor_log_interval":"60s","metric_emission_interval":"60s","metric_hold_time":"300s"}"#
         );
         let config: StateControllerConfig = serde_json::from_str(&config_str).unwrap();
         assert_eq!(config, input);
@@ -2979,6 +3211,7 @@ mod tests {
                 switches_created_per_run: 9,
                 rotate_switch_nvos_credentials: Arc::new(false.into()),
                 use_onboard_nic: Arc::new(false.into()),
+                explore_mode: SiteExplorerExploreMode::LibRedfish,
             }
         );
         assert_eq!(
@@ -2990,12 +3223,15 @@ mod tests {
                     max_concurrency: 22,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
                 dpu_wait_time: Duration::minutes(7),
                 power_down_wait: Duration::seconds(17),
                 failure_retry_time: Duration::minutes(70),
                 dpu_up_threshold: Duration::minutes(77),
                 scout_reporting_timeout: Duration::minutes(5),
+                uefi_boot_wait: Duration::minutes(5),
             }
         );
         assert_eq!(
@@ -3008,6 +3244,8 @@ mod tests {
                     max_concurrency: 1888,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3020,6 +3258,8 @@ mod tests {
                     max_concurrency: 1777,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3145,9 +3385,20 @@ mod tests {
                 switches_created_per_run: 9,
                 rotate_switch_nvos_credentials: Arc::new(false.into()),
                 use_onboard_nic: Arc::new(false.into()),
+                explore_mode: SiteExplorerExploreMode::LibRedfish,
             }
         );
 
+        assert_eq!(
+            config.host_health,
+            HostHealthConfig {
+                hardware_health_reports: model::machine::HardwareHealthReportsConfig::Disabled,
+                dpu_agent_version_staleness_threshold: Duration::days(1),
+                prevent_allocations_on_stale_dpu_agent_version: true,
+                prevent_allocations_on_scout_heartbeat_timeout: true,
+                suppress_external_alerting_on_scout_heartbeat_timeout: false,
+            }
+        );
         assert_eq!(
             config.machine_state_controller,
             MachineStateControllerConfig {
@@ -3157,12 +3408,15 @@ mod tests {
                     max_concurrency: 999,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
                 dpu_wait_time: Duration::minutes(3),
                 power_down_wait: Duration::seconds(13),
                 failure_retry_time: Duration::minutes(31),
                 dpu_up_threshold: Duration::minutes(33),
                 scout_reporting_timeout: Duration::minutes(20),
+                uefi_boot_wait: Duration::minutes(5),
             }
         );
         assert_eq!(
@@ -3175,6 +3429,8 @@ mod tests {
                     max_concurrency: 888,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3187,6 +3443,8 @@ mod tests {
                     max_concurrency: 777,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3417,9 +3675,20 @@ mod tests {
                 switches_created_per_run: 9,
                 rotate_switch_nvos_credentials: Arc::new(false.into()),
                 use_onboard_nic: Arc::new(false.into()),
+                explore_mode: SiteExplorerExploreMode::LibRedfish,
             }
         );
 
+        assert_eq!(
+            config.host_health,
+            HostHealthConfig {
+                hardware_health_reports: model::machine::HardwareHealthReportsConfig::Disabled,
+                dpu_agent_version_staleness_threshold: Duration::days(1),
+                prevent_allocations_on_stale_dpu_agent_version: true,
+                prevent_allocations_on_scout_heartbeat_timeout: true,
+                suppress_external_alerting_on_scout_heartbeat_timeout: false,
+            }
+        );
         assert_eq!(
             config.machine_state_controller,
             MachineStateControllerConfig {
@@ -3429,12 +3698,15 @@ mod tests {
                     max_concurrency: 22,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
                 dpu_wait_time: Duration::minutes(7),
                 power_down_wait: Duration::seconds(17),
                 failure_retry_time: Duration::minutes(70),
                 dpu_up_threshold: Duration::minutes(77),
                 scout_reporting_timeout: Duration::minutes(20),
+                uefi_boot_wait: Duration::minutes(5),
             }
         );
         assert_eq!(
@@ -3447,6 +3719,8 @@ mod tests {
                     max_concurrency: 1888,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3459,6 +3733,8 @@ mod tests {
                     max_concurrency: 1777,
                     processor_dispatch_interval: std::time::Duration::from_secs(2),
                     processor_log_interval: std::time::Duration::from_secs(60),
+                    metric_emission_interval: std::time::Duration::from_secs(60),
+                    metric_hold_time: std::time::Duration::from_secs(5 * 60),
                 },
             }
         );
@@ -3768,6 +4044,7 @@ mqtt_endpoint = "mqtt.forge"
                 hb_interval: Duration::minutes(2),
                 subnet_ip: Ipv4Addr::UNSPECIFIED,
                 subnet_mask: 0_i32,
+                auth: MqttAuthConfig::default(),
             }
         );
     }
@@ -3945,6 +4222,42 @@ firmware_url = "https://firmware.example.com/fw-b.bin"
             .get_supernic_firmware_profile("900-9D3B4-00CV-TA0", "MT_0000000999")
             .unwrap();
         assert_eq!(p2.firmware_spec.version, "32.44.0000");
+    }
+
+    #[test]
+    fn get_mlxconfig_profile_lookup() {
+        let config: CarbideConfig = Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/full_config.toml")))
+            .extract()
+            .unwrap();
+
+        // Profile exists in config.
+        let profile = config
+            .get_mlxconfig_profile("test-profile")
+            .expect("should find test-profile");
+        assert_eq!(profile.name, "test-profile");
+        assert_eq!(profile.registry.name, "mlx_generic");
+
+        // Second profile also exists.
+        let profile2 = config
+            .get_mlxconfig_profile("test-profile2")
+            .expect("should find test-profile2");
+        assert_eq!(profile2.name, "test-profile2");
+
+        // Non-existent profile returns None.
+        assert!(config.get_mlxconfig_profile("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_mlxconfig_profile_none_when_unconfigured() {
+        let config: CarbideConfig = Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/min_config.toml")))
+            .extract()
+            .unwrap();
+
+        // No mlx-config-profiles section at all.
+        assert!(config.mlxconfig_profiles.is_none());
+        assert!(config.get_mlxconfig_profile("anything").is_none());
     }
 
     #[test]

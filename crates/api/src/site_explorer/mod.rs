@@ -18,12 +18,14 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Display;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use carbide_network::sanitized_mac;
 use carbide_uuid::machine::MachineType;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::power_shelf::{PowerShelfIdSource, PowerShelfType};
@@ -34,7 +36,6 @@ use db::{
     self, DatabaseError, ObjectFilter, Transaction, machine, network_segment as db_network_segment,
     power_shelf as db_power_shelf, switch as db_switch,
 };
-use forge_network::sanitized_mac;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{StreamExt, TryFutureExt};
 use itertools::Itertools;
@@ -55,7 +56,8 @@ use model::site_explorer::{
 };
 use model::switch::{NewSwitch, SwitchConfig};
 use sqlx::PgPool;
-use tokio::sync::oneshot;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use version_compare::Cmp;
 
@@ -179,19 +181,22 @@ impl SiteExplorer {
     }
 
     /// Start the SiteExplorer and return a [sending channel](tokio::sync::oneshot::Sender) that will stop the SiteExplorer when dropped.
-    pub fn start(mut self) -> eyre::Result<oneshot::Sender<i32>> {
-        let (stop_sender, stop_receiver) = oneshot::channel();
-
+    pub fn start(
+        mut self,
+        join_set: &mut JoinSet<()>,
+        cancel_token: CancellationToken,
+    ) -> io::Result<()> {
         if self.enabled {
-            tokio::task::Builder::new()
+            join_set
+                .build_task()
                 .name("site_explorer")
-                .spawn(async move { self.run(stop_receiver).await })?;
+                .spawn(async move { self.run(cancel_token).await })?;
         }
 
-        Ok(stop_sender)
+        Ok(())
     }
 
-    async fn run(&mut self, mut stop_receiver: oneshot::Receiver<i32>) {
+    async fn run(&mut self, cancel_token: CancellationToken) {
         let timer = PeriodicTimer::new(self.config.run_interval);
         loop {
             let tick = timer.tick();
@@ -206,7 +211,7 @@ impl SiteExplorer {
 
             tokio::select! {
                 _ = tick.sleep() => {},
-                _ = &mut stop_receiver => {
+                _ = cancel_token.cancelled() => {
                     tracing::info!("SiteExplorer stop was requested");
                     return;
                 }
@@ -322,8 +327,8 @@ impl SiteExplorer {
 
         // Grab them all because we care about everything,
         // not just the subset in the current run.
-        let explored_endpoints = db::explored_endpoints::find_all(&mut txn).await?;
-        let explored_managed_hosts = db::explored_managed_host::find_all(&mut txn).await?;
+        let explored_endpoints = db::explored_endpoints::find_all(txn.as_pgconn()).await?;
+        let explored_managed_hosts = db::explored_managed_host::find_all(txn.as_pgconn()).await?;
 
         txn.rollback().await?;
 
@@ -718,7 +723,7 @@ impl SiteExplorer {
 
         let mac_addresses = report.all_mac_addresses();
         for mac_address in mac_addresses {
-            let mi = db::machine_interface::find_by_mac_address(&mut txn, mac_address).await?;
+            let mi = db::machine_interface::find_by_mac_address(&mut *txn, mac_address).await?;
             if let Some(interface) = mi.first() {
                 db::machine_interface::associate_interface_with_machine(
                     &interface.id,
@@ -731,7 +736,7 @@ impl SiteExplorer {
 
         let mac_addresses = report.all_mac_addresses();
         for mac_address in mac_addresses {
-            let mi = db::machine_interface::find_by_mac_address(&mut txn, mac_address).await?;
+            let mi = db::machine_interface::find_by_mac_address(&mut *txn, mac_address).await?;
             if let Some(interface) = mi.first() {
                 db::machine_interface::associate_interface_with_machine(
                     &interface.id,
@@ -836,7 +841,7 @@ impl SiteExplorer {
             .map_err(|e| CarbideError::InvalidArgument(format!("Invalid MAC address: {}", e)))?;
 
         let interface =
-            db::machine_interface::find_by_mac_address(&mut txn, host_mac_address).await?;
+            db::machine_interface::find_by_mac_address(&mut *txn, host_mac_address).await?;
 
         let (host_nvos_mac_addresses, host_nvos_ip_addresses) =
             if let Some(interface) = interface.first() {
@@ -905,7 +910,7 @@ impl SiteExplorer {
 
         let mac_addresses = explored_endpoint.report.all_mac_addresses();
         for mac_address in mac_addresses {
-            let mi = db::machine_interface::find_by_mac_address(&mut txn, mac_address).await?;
+            let mi = db::machine_interface::find_by_mac_address(&mut *txn, mac_address).await?;
             if let Some(interface) = mi.first() {
                 db::machine_interface::associate_interface_with_machine(
                     &interface.id,
@@ -1453,7 +1458,7 @@ impl SiteExplorer {
             db::network_segment::list_segment_ids(&mut txn, Some(NetworkSegmentType::Underlay))
                 .await?;
         let interfaces = db::machine_interface::find_all(&mut txn).await?;
-        let explored_endpoints = db::explored_endpoints::find_all(&mut txn).await?;
+        let explored_endpoints = db::explored_endpoints::find_all(txn.as_pgconn()).await?;
         let expected_switches = db::expected_switch::find_all(&mut txn).await?;
         let expected_machines = db::expected_machine::find_all(&mut txn).await?;
         let expected_power_shelves = db::expected_power_shelf::find_all(&mut txn).await?;
@@ -2226,7 +2231,7 @@ impl SiteExplorer {
         let mut txn = self.txn_begin().await?;
 
         let is_endpoint_in_managed_host =
-            is_endpoint_in_managed_host(bmc_ip_address, &mut txn).await?;
+            is_endpoint_in_managed_host(bmc_ip_address, txn.as_pgconn()).await?;
 
         txn.commit().await?;
 
@@ -2702,27 +2707,11 @@ fn find_host_pf_mac_address(dpu_ep: &ExploredEndpoint) -> Result<MacAddress, Str
     // back to the legacy method via get_sys_image_version.
 
     // Try the explored computer-system base_mac first
-    if let Some(system_mac) = dpu_ep
-        .report
-        .systems
-        .first()
-        .and_then(|s| s.base_mac.clone())
-    {
-        // Once we've got some unsanitized MAC value,
-        // sanitize it (stripping out garbage like spaces, double quotes, etc),
-        // and return a sanitized MA:CA:DD:RE:SS as a MacAddress.
-        match sanitized_mac(&system_mac) {
-            Ok(mac) => return Ok(mac),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to sanitize ComputerSystem base_mac, falling back to legacy method: {} (source_mac: {})",
-                    e,
-                    system_mac
-                );
-            }
-        }
+    if let Some(system_mac) = dpu_ep.report.systems.first().and_then(|s| s.base_mac) {
+        return Ok(system_mac.to_mac());
     }
 
+    tracing::warn!("ComputerSystem doesn't have base_mac, falling back to legacy method");
     let legacy_mac = get_base_mac_from_sys_image_version(get_sys_image_version(
         dpu_ep.report.service.as_ref(),
     )?)?;
@@ -2741,7 +2730,9 @@ pub async fn get_machine_state_by_bmc_ip(
 ) -> Result<String, DatabaseError> {
     let mut txn = Transaction::begin(database_connection).await?;
 
-    let state = match db::machine_topology::find_machine_id_by_bmc_ip(&mut txn, bmc_ip).await? {
+    let state = match db::machine_topology::find_machine_id_by_bmc_ip(txn.as_pgconn(), bmc_ip)
+        .await?
+    {
         Some(machine_id) => {
             match machine::find_one(&mut txn, &machine_id, MachineSearchConfig::default()).await? {
                 Some(machine) => machine.current_state().to_string(),
