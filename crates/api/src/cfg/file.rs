@@ -56,14 +56,14 @@ use crate::state_controller::config::IterationConfig;
 
 const MAX_IB_PARTITION_PER_TENANT: i32 = 31;
 
-static BF2_NIC: &str = "24.47.1026";
-static BF2_BMC: &str = "BF-25.10-9";
+static BF2_NIC: &str = "24.47.2682";
+static BF2_BMC: &str = "BF-25.10-20";
 static BF2_CEC: &str = "4-15";
-static BF2_UEFI: &str = "4.13.0-26-g337fea6bfd";
-static BF3_NIC: &str = "32.47.1026";
-static BF3_BMC: &str = "BF-25.10-9";
+static BF2_UEFI: &str = "4.13.2-12-g943a91640d";
+static BF3_NIC: &str = "32.47.2682";
+static BF3_BMC: &str = "BF-25.10-20";
 static BF3_CEC: &str = "00.02.0195.0000_n02";
-static BF3_UEFI: &str = "4.13.0-26-g337fea6bfd";
+static BF3_UEFI: &str = "4.13.2-12-g943a91640d";
 
 /// nico-api configuration file content
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -395,6 +395,25 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub selected_profile: libredfish::BiosProfileType,
 
+    /// Vendor-specific iDRAC/BMC manager attributes applied during machine_setup,
+    /// before BMC lockdown. Keyed by vendor → model → profile → attribute name.
+    ///
+    /// These target the manager OEM attributes endpoint (e.g.
+    /// `Managers/{id}/Oem/Dell/DellAttributes/{id}` on Dell), as opposed to
+    /// `bios_profiles` which targets BIOS settings.
+    ///
+    /// Model names are normalized to lowercase with spaces replaced by underscores
+    /// (e.g. `"PowerEdge R760"` → `"poweredge_r760"`).
+    ///
+    /// Example (carbide.toml):
+    /// ```toml
+    /// # Disable PSU Hot Spare on Dell R760 to prevent fan spin-up (nvbugs-5834644)
+    /// [oem_manager_profiles.Dell.poweredge_r760.performance]
+    /// "ServerPwr.1.PSRapidOn" = "Disabled"
+    /// ```
+    #[serde(default)]
+    pub oem_manager_profiles: libredfish::BiosProfileVendor,
+
     /// DpaConfig refers to East West Ethernet (aka
     /// Cluster Interconnect Network) configuration
     #[serde(default)]
@@ -484,8 +503,10 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub rack_management_enabled: bool,
 
-    /// URL of the Rack Manager Service API for rack-level firmware upgrades and power sequencing.
-    pub rms_api_url: Option<String>,
+    /// Rack Manager Service configuration for rack-level firmware upgrades,
+    /// power sequencing, and mTLS connectivity.
+    #[serde(default)]
+    pub rms: RmsConfig,
 
     /// rack_types contains the rack type definitions. When expected racks
     /// are created, they are given a rack_type name to reference. This maps
@@ -529,6 +550,30 @@ pub struct CarbideConfig {
     /// The URL to use for overriding the PXE boot url on ARM machines.
     #[serde(default)]
     pub arm_pxe_boot_url_override: Option<String>,
+
+    /// Alternate API URL for external hosts that cannot resolve
+    /// https://carbide-pxe.forge. This be an IP (e.g., "https://10.0.0.1:1079"),
+    /// or an externally resolvable hostname (e.g.,
+    /// "https://carbide-stack-api.corp.example.com"). This is the URL
+    /// that gets handed back to interfaces assigned ot the static-assignments
+    /// subnet. If not set, external hosts will just get the "internal"
+    /// variant of api_url.
+    #[serde(default)]
+    pub external_api_url: Option<String>,
+
+    /// Alternate PXE URL for external hosts (e.g., "http://10.0.0.1:8080"
+    /// or "http://carbide-stack-pxe.corp.example.com"). Used for cloud-init and
+    /// root CA retrieval for interfaces on the static-assignments segment,
+    /// and follows the same rules as external_api_url above.
+    #[serde(default)]
+    pub external_pxe_url: Option<String>,
+
+    /// Alternate static PXE URL for external hosts (e.g.,
+    /// "http://10.0.0.1:8081" or "http://carbide-stack-static.corp.example.com").
+    /// Used for kernel/blob downloads on the static-assignments segment.
+    /// If not set, falls back to `external_pxe_url`.
+    #[serde(default)]
+    pub external_static_pxe_url: Option<String>,
 
     /// Controls enforcement of compute allocations when a new instance is
     /// requested.
@@ -1994,6 +2039,30 @@ fn default_listen() -> SocketAddr {
 
 fn default_max_database_connections() -> u32 {
     1000
+}
+
+fn default_rms_enforce_tls() -> bool {
+    true
+}
+
+/// Rack Manager Service (RMS) configuration for API connectivity and mTLS.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RmsConfig {
+    /// URL of the RMS API for rack-level firmware upgrades and power sequencing.
+    pub api_url: Option<String>,
+
+    /// Path to the root CA certificate for TLS verification when connecting to RMS.
+    pub root_ca_path: Option<String>,
+
+    /// Path to the client certificate PEM for mTLS with RMS.
+    pub client_cert: Option<String>,
+
+    /// Path to the client private key PEM for mTLS with RMS.
+    pub client_key: Option<String>,
+
+    /// Enforce TLS when connecting to RMS. Defaults to true.
+    #[serde(default = "default_rms_enforce_tls")]
+    pub enforce_tls: bool,
 }
 
 /// DpuConfig related internal configuration

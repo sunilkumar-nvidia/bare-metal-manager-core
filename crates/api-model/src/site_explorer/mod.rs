@@ -377,18 +377,23 @@ pub enum PreingestionState {
     ScriptRunning,
     BfbRecoveryNeeded {
         reason: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        host_bmc_ip: Option<IpAddr>,
+        host_bmc_ip: IpAddr,
+        #[serde(default)]
+        pre_copy_powercycle: bool,
     },
-    BfbWaitingForPlatformPowercycle {
+    BfbPlatformPowercycle {
         host_bmc_ip: IpAddr,
         phase: BfbPlatformPowercyclePhase,
+        #[serde(default)]
+        post_install: bool,
     },
     BfbCopyInProgress {
         started_at: DateTime<Utc>,
+        host_bmc_ip: IpAddr,
     },
     BfbInstallationWait {
         started_at: DateTime<Utc>,
+        host_bmc_ip: IpAddr,
     },
     InitialReset {
         phase: InitialResetPhase,
@@ -1344,6 +1349,7 @@ impl From<PowerState> for rpc::site_explorer::PowerState {
             PowerState::PoweringOff => rpc::site_explorer::PowerState::PoweringOff,
             PowerState::PoweringOn => rpc::site_explorer::PowerState::PoweringOn,
             PowerState::Paused => rpc::site_explorer::PowerState::Paused,
+            PowerState::Unknown => rpc::site_explorer::PowerState::Unknown,
         }
     }
 }
@@ -1356,6 +1362,7 @@ pub enum PowerState {
     PoweringOff,
     PoweringOn,
     Paused,
+    Unknown,
 }
 
 /// `Manager` definition. Matches redfish definition
@@ -1745,6 +1752,7 @@ impl From<libredfish::PowerState> for PowerState {
             libredfish::PowerState::PoweringOn => PowerState::PoweringOn,
             libredfish::PowerState::Paused => PowerState::Paused,
             libredfish::PowerState::Reset => PowerState::PoweringOn,
+            libredfish::PowerState::Unknown => PowerState::Unknown,
         }
     }
 }

@@ -674,6 +674,7 @@ impl EndpointExplorer for BmcEndpointExplorer {
 
     // 1) Authenticate and set the BMC root account credentials
     // 2) Authenticate and set the BMC forge-admin account credentials (TODO)
+    #[tracing::instrument(skip_all, fields(object_id=%bmc_ip_address))]
     async fn explore_endpoint(
         &self,
         bmc_ip_address: SocketAddr,
@@ -735,18 +736,20 @@ impl EndpointExplorer for BmcEndpointExplorer {
                     }
                 };
 
-                // Lite-On power shelf BMCs use "chassis" as their Chassis ID,
-                // so that's the one we'll need to collect data from (we actually
-                // look at the Manufacturer name).
-                //
-                // TODO(chet): This hack was added for Lite-On power shelves,
-                // but I'd really like to try to at least make it some generic
-                // fallback eventually (although I think Lite-On is working on
-                // a fix on their side).
-                let vendor = self
+                // Lite-On power shelf BMCs don't expose vendor details in the
+                // service root, so we fall back to checking the Manufacturer
+                // field across all Chassis entries.
+                let vendor = match self
                     .redfish_client
-                    .probe_vendor_name_from_chassis(bmc_ip_address, username, password, "chassis")
-                    .await?;
+                    .probe_vendor_name_from_chassis(bmc_ip_address, username, password)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(chassis_err) => {
+                        tracing::error!(%bmc_ip_address, "Failed to probe vendor from chassis: {chassis_err}");
+                        return Err(e);
+                    }
+                };
                 if !vendor.to_lowercase().contains("lite-on") {
                     return Err(e);
                 }

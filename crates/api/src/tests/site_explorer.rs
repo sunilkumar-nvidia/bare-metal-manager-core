@@ -39,6 +39,7 @@ use model::site_explorer::{
     Chassis, ComputerSystem, EndpointExplorationError, EndpointExplorationReport, EndpointType,
     ExploredDpu, ExploredEndpoint, ExploredManagedHost, PreingestionState, UefiDevicePath,
 };
+use model::switch::SwitchSearchFilter;
 use rpc::forge::GetSiteExplorationRequest;
 use rpc::forge::forge_server::Forge;
 use rpc::site_explorer::{
@@ -237,6 +238,7 @@ async fn test_site_explorer_default_pause_ingestion_and_poweron(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // check the ingestion state of the machine
@@ -447,6 +449,7 @@ async fn test_site_explorer_main(pool: sqlx::PgPool) -> Result<(), Box<dyn std::
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -913,6 +916,7 @@ async fn test_site_explorer_audit_exploration_results(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -1119,6 +1123,7 @@ async fn test_site_explorer_reexplore(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -1386,6 +1391,7 @@ async fn test_fallback_dpu_serial(pool: sqlx::PgPool) -> Result<(), Box<dyn std:
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create expected_machine entry for host1 w.o fallback_dpu_serial_number
@@ -1604,6 +1610,7 @@ async fn test_site_explorer_health_report(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Run site explorer and check the health state of the Machine
@@ -2179,6 +2186,7 @@ async fn test_site_explorer_unknown_vendor(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -2395,6 +2403,7 @@ async fn test_machine_creation_with_sku(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create expected_machine entry for host1 w.o fallback_dpu_serial_number
@@ -2732,6 +2741,7 @@ async fn test_expected_machine_device_type_metrics(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Run site explorer to collect metrics
@@ -2880,6 +2890,7 @@ async fn test_site_explorer_power_shelf_discovery(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3033,6 +3044,7 @@ async fn test_site_explorer_switch_discovery(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3069,7 +3081,7 @@ async fn test_site_explorer_switch_discovery(
     );
 
     let mut txn = env.pool.begin().await?;
-    let switches = db::switch::find_all(txn.as_mut()).await?;
+    let switches = db::switch::find_ids(txn.as_mut(), SwitchSearchFilter::default()).await?;
     println!("switches: {:?}", switches);
     txn.commit().await?;
     assert_eq!(switches.len(), 1, "Expected one switch to be created");
@@ -3182,6 +3194,7 @@ async fn test_site_explorer_power_shelf_with_expected_config(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3336,6 +3349,7 @@ async fn test_site_explorer_power_shelf_creation_limit(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3470,6 +3484,7 @@ async fn test_site_explorer_power_shelf_disabled(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3573,6 +3588,7 @@ async fn test_site_explorer_power_shelf_error_handling(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();
@@ -3639,6 +3655,7 @@ async fn test_site_explorer_creates_power_shelf(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create a power shelf using FakePowerShelf
@@ -3727,12 +3744,7 @@ async fn test_site_explorer_creates_power_shelf(
     // Test power shelf creation
     assert!(
         explorer
-            .create_power_shelf(
-                explored_endpoint.clone(),
-                exploration_report.clone(),
-                &expected_power_shelf,
-                &env.pool,
-            )
+            .create_power_shelf(explored_endpoint.clone(), &expected_power_shelf, &env.pool,)
             .await?
     );
 
@@ -3755,12 +3767,7 @@ async fn test_site_explorer_creates_power_shelf(
     // Test that duplicate creation returns false
     assert!(
         !explorer
-            .create_power_shelf(
-                explored_endpoint,
-                exploration_report,
-                &expected_power_shelf,
-                &env.pool,
-            )
+            .create_power_shelf(explored_endpoint, &expected_power_shelf, &env.pool,)
             .await?
     );
 
@@ -3948,17 +3955,13 @@ async fn test_power_shelf_state_history(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create the power shelf using site explorer
     assert!(
         explorer
-            .create_power_shelf(
-                explored_endpoint.clone(),
-                exploration_report.clone(),
-                &expected_power_shelf,
-                &env.pool,
-            )
+            .create_power_shelf(explored_endpoint.clone(), &expected_power_shelf, &env.pool,)
             .await?
     );
 
@@ -4207,6 +4210,7 @@ async fn test_power_shelf_state_history_multiple(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create the power shelves using site explorer
@@ -4214,7 +4218,6 @@ async fn test_power_shelf_state_history_multiple(
         explorer
             .create_power_shelf(
                 explored_endpoint1.clone(),
-                exploration_report1.clone(),
                 &expected_power_shelf1,
                 &env.pool,
             )
@@ -4225,7 +4228,6 @@ async fn test_power_shelf_state_history_multiple(
         explorer
             .create_power_shelf(
                 explored_endpoint2.clone(),
-                exploration_report2.clone(),
                 &expected_power_shelf2,
                 &env.pool,
             )
@@ -4430,17 +4432,13 @@ async fn test_power_shelf_state_history_error_handling(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     // Create the power shelf using site explorer
     assert!(
         explorer
-            .create_power_shelf(
-                explored_endpoint.clone(),
-                exploration_report.clone(),
-                &expected_power_shelf,
-                &env.pool,
-            )
+            .create_power_shelf(explored_endpoint.clone(), &expected_power_shelf, &env.pool,)
             .await?
     );
 
@@ -4609,6 +4607,7 @@ async fn test_site_explorer_power_shelf_discovery_with_static_ip(
         env.common_pools.clone(),
         env.api.work_lock_manager_handle.clone(),
         env.rms_sim.as_rms_client(),
+        env.test_credential_manager.clone(),
     );
 
     explorer.run_single_iteration().await.unwrap();

@@ -18,7 +18,6 @@
 use carbide_uuid::power_shelf::PowerShelfId;
 use chrono::prelude::*;
 use config_version::{ConfigVersion, Versioned};
-use futures::StreamExt;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::metadata::Metadata;
 use model::power_shelf::{NewPowerShelf, PowerShelf, PowerShelfControllerState};
@@ -159,20 +158,6 @@ pub async fn find_by_id(
     }
 }
 
-pub async fn list_segment_ids(txn: &mut PgConnection) -> DatabaseResult<Vec<PowerShelfId>> {
-    let query =
-        sqlx::query_as::<_, PowerShelfId>("SELECT id FROM power_shelves WHERE deleted IS NULL");
-
-    let mut rows = query.fetch(txn);
-    let mut ids = Vec::new();
-
-    while let Some(row) = rows.next().await {
-        ids.push(row.map_err(|e| DatabaseError::new("list_segment_ids power_shelf", e))?);
-    }
-
-    Ok(ids)
-}
-
 pub async fn find_ids(
     txn: impl DbReader<'_>,
     filter: model::power_shelf::PowerShelfSearchFilter,
@@ -311,19 +296,21 @@ use std::net::IpAddr;
 
 use mac_address::MacAddress;
 
-/// Resolve PowerShelfIds to BMC/PMC IPs.
+/// Resolve PowerShelfIds to BMC/PMC IPs via the machine_interfaces path.
 pub async fn find_bmc_ips_by_power_shelf_ids(
     db: impl crate::db_read::DbReader<'_>,
     power_shelf_ids: &[PowerShelfId],
 ) -> DatabaseResult<Vec<(PowerShelfId, IpAddr)>> {
     let sql = r#"
-        SELECT
+        SELECT DISTINCT ON (ps.id)
             ps.id,
-            eps.bmc_ip_address
+            mia.address
         FROM power_shelves ps
         JOIN expected_power_shelves eps ON eps.serial_number = ps.config->>'name'
+        JOIN machine_interfaces mi ON mi.mac_address = eps.bmc_mac_address
+        JOIN machine_interface_addresses mia ON mia.interface_id = mi.id
         WHERE ps.id = ANY($1)
-          AND eps.bmc_ip_address IS NOT NULL
+        ORDER BY ps.id
     "#;
 
     sqlx::query_as(sql)
@@ -346,15 +333,18 @@ pub async fn find_power_shelf_endpoints_by_ids(
     db: impl crate::db_read::DbReader<'_>,
     power_shelf_ids: &[PowerShelfId],
 ) -> DatabaseResult<Vec<PowerShelfEndpointRow>> {
+    // DISTINCT ON guards against a machine_interface having multiple addresses
     let sql = r#"
-        SELECT
+        SELECT DISTINCT ON (ps.id)
             ps.id                AS power_shelf_id,
             eps.bmc_mac_address  AS pmc_mac,
-            eps.bmc_ip_address       AS pmc_ip
+            mia.address          AS pmc_ip
         FROM power_shelves ps
         JOIN expected_power_shelves eps ON eps.serial_number = ps.config->>'name'
+        JOIN machine_interfaces mi ON mi.mac_address = eps.bmc_mac_address
+        JOIN machine_interface_addresses mia ON mia.interface_id = mi.id
         WHERE ps.id = ANY($1)
-          AND eps.bmc_ip_address IS NOT NULL
+        ORDER BY ps.id
     "#;
 
     sqlx::query_as(sql)

@@ -404,6 +404,17 @@ impl RedfishClientPool for RedfishClientPoolImpl {
                 .create_client_with_custom_headers(endpoint, custom_headers)
                 .await
                 .map_err(RedfishClientCreationError::RedfishError),
+            // Unknown means "no vendor" — return a standard client without
+            // making any HTTP calls (used by the anonymous probe client).
+            // This restores the behavior of the old `initialize: false` path
+            // which called create_standard_client. The full initialization
+            // path (create_client_with_vendor) makes HTTP calls to /Systems,
+            // /Managers, etc. that fail with 401 on BMCs requiring auth.
+            Some(RedfishVendor::Unknown) => self
+                .pool
+                .create_standard_client_with_custom_headers(endpoint, custom_headers)
+                .map_err(RedfishClientCreationError::RedfishError)
+                .map(|c| c as Box<dyn Redfish>),
             // Use the provided vendor directly.
             Some(vendor) => self
                 .pool
@@ -731,6 +742,9 @@ pub mod test_support {
         Power(libredfish::SystemPowerControl),
         BmcReset,
         SetUtcTimezone,
+        MachineSetup {
+            oem_manager_profiles: libredfish::BiosProfileVendor,
+        },
     }
 
     pub struct RedfishSimActions {
@@ -803,7 +817,7 @@ pub mod test_support {
                 >,
             >,
             _profile_type: libredfish::BiosProfileType,
-            _oem_manager_profiles: &HashMap<
+            oem_manager_profiles: &HashMap<
                 libredfish::model::service_root::RedfishVendor,
                 HashMap<
                     String,
@@ -811,6 +825,11 @@ pub mod test_support {
                 >,
             >,
         ) -> Result<(), RedfishError> {
+            let mut state = self.state.lock().unwrap();
+            let host_state = state.hosts.get_mut(&self._host).unwrap();
+            host_state.actions.push(RedfishSimAction::MachineSetup {
+                oem_manager_profiles: oem_manager_profiles.clone(),
+            });
             Ok(())
         }
 

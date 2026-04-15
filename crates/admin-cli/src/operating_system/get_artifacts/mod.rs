@@ -15,23 +15,17 @@
  * limitations under the License.
  */
 
-use librms::RmsApi;
-use librms::protos::rack_manager::NewNodeInfo;
+pub mod args;
+pub mod cmd;
 
-use crate::CarbideError;
+use ::rpc::admin_cli::CarbideCliResult;
+pub use args::Args;
 
-pub async fn add_node_to_rms(
-    rms_client: &dyn RmsApi,
-    new_node_info: NewNodeInfo,
-) -> Result<(), CarbideError> {
-    let request = librms::protos::rack_manager::AddNodeRequest {
-        metadata: None,
-        node_info: vec![new_node_info],
-    };
-    rms_client
-        .add_node(request)
-        .await
-        .map_err(CarbideError::RackManagerError)?;
+use crate::cfg::run::Run;
+use crate::cfg::runtime::RuntimeContext;
 
-    Ok(())
+impl Run for Args {
+    async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
+        cmd::get_artifacts(self, ctx.config.format, &ctx.api_client).await
+    }
 }

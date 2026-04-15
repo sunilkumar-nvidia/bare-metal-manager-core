@@ -20,7 +20,6 @@ use std::net::IpAddr;
 use carbide_uuid::switch::SwitchId;
 use chrono::prelude::*;
 use config_version::{ConfigVersion, Versioned};
-use futures::StreamExt;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::metadata::Metadata;
 use model::rack::RackFirmwareUpgradeStatus;
@@ -78,7 +77,7 @@ pub async fn create(txn: &mut PgConnection, new_switch: &NewSwitch) -> DatabaseR
     };
 
     let query = sqlx::query_as::<_, SwitchId>(
-        "INSERT INTO switches (id, name, config, controller_state, controller_state_version, bmc_mac_address, description, labels, version, rack_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10) RETURNING id",
+        "INSERT INTO switches (id, name, config, controller_state, controller_state_version, bmc_mac_address, description, labels, version, rack_id, slot_number, tray_index) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12) RETURNING id",
     );
     let id = query
         .bind(new_switch.id)
@@ -91,6 +90,8 @@ pub async fn create(txn: &mut PgConnection, new_switch: &NewSwitch) -> DatabaseR
         .bind(sqlx::types::Json(&metadata.labels))
         .bind(version)
         .bind(&new_switch.rack_id)
+        .bind(new_switch.slot_number)
+        .bind(new_switch.tray_index)
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::new("create switch", e))?;
@@ -111,6 +112,8 @@ pub async fn create(txn: &mut PgConnection, new_switch: &NewSwitch) -> DatabaseR
         metadata,
         version,
         rack_id: new_switch.rack_id.clone(),
+        slot_number: new_switch.slot_number,
+        tray_index: new_switch.tray_index,
     })
 }
 
@@ -146,19 +149,6 @@ pub async fn find_by_id(txn: &mut PgConnection, id: &SwitchId) -> DatabaseResult
             ),
         ))
     }
-}
-
-pub async fn find_all(txn: &mut PgConnection) -> DatabaseResult<Vec<SwitchId>> {
-    let query = sqlx::query_as::<_, SwitchId>("SELECT id FROM switches WHERE deleted IS NULL");
-
-    let mut rows = query.fetch(txn);
-    let mut ids = Vec::new();
-
-    while let Some(row) = rows.next().await {
-        ids.push(row.map_err(|e| DatabaseError::new("find_all switch", e))?);
-    }
-
-    Ok(ids)
 }
 
 pub async fn find_ids(
@@ -302,6 +292,22 @@ pub async fn update_firmware_upgrade_status(
         .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::new("update_firmware_upgrade_status", e))?;
+    Ok(())
+}
+
+pub async fn update_slot_and_tray(
+    txn: &mut PgConnection,
+    switch_id: &SwitchId,
+    slot_number: Option<i32>,
+    tray_index: Option<i32>,
+) -> DatabaseResult<()> {
+    sqlx::query("UPDATE switches SET slot_number = $1, tray_index = $2 WHERE id = $3")
+        .bind(slot_number)
+        .bind(tray_index)
+        .bind(switch_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::new("update_slot_and_tray", e))?;
     Ok(())
 }
 
