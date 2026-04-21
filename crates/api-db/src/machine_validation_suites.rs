@@ -21,10 +21,10 @@ use model::machine_validation::{
     MachineValidationTestUpdateRequest, MachineValidationTestsGetRequest,
 };
 use regex::Regex;
+use sqlx::Execute;
 use sqlx::PgConnection;
 use sqlx::Postgres;
 use sqlx::QueryBuilder;
-use sqlx::Execute;
 
 use crate::db_read::DbReader;
 use crate::{DatabaseError, DatabaseResult};
@@ -33,6 +33,11 @@ const MVT_TABLE: &str = "machine_validation_tests";
 
 /// INSERT semantics match the previous serde_json-driven builder: skip `Option::None`, skip empty
 /// `Vec`s for array columns, always set `version`, `test_id`, `modified_by`.
+///
+/// `name`, `command`, and `args` are always emitted as columns and bound values: in
+/// `forge.proto` they are plain `string` fields on `MachineValidationTestAddRequest` (not
+/// `optional`), the Rust model uses `String`, and the `machine_validation_tests` table defines
+/// them `NOT NULL`.
 fn push_insert<'a>(
     req: &'a MachineValidationTestAddRequest,
     version: &'a str,
@@ -260,6 +265,12 @@ fn push_update<'a>(
     Ok(qb)
 }
 
+/// Applies `MachineValidationTestsGetRequest` fields as `AND ...` filters with bound parameters.
+///
+/// **Maintenance:** When adding a filterable field to `MachineValidationTestsGetRequest` in
+/// `forge.proto`, extend this function (and add tests) so the new field is wired through. The
+/// legacy JSON-based `build_select_query` iterated serialized keys automatically; this path is
+/// explicit and will not pick up new proto fields by itself.
 fn push_select_filters<'a>(
     qb: &mut QueryBuilder<'a, Postgres>,
     req: &'a MachineValidationTestsGetRequest,
@@ -334,12 +345,7 @@ pub async fn save(
         .collect();
 
     let version_s = version.version_string();
-    let mut qb = push_insert(
-        &req,
-        version_s.as_str(),
-        &test_id,
-        "User",
-    );
+    let mut qb = push_insert(&req, version_s.as_str(), &test_id, "User");
     let q = qb.build_query_scalar::<String>();
     let sql = q.sql();
     let returned = q
@@ -366,12 +372,7 @@ pub async fn update(
         .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
         .collect();
 
-    let mut qb = push_update(
-        &payload,
-        &req.version,
-        &req.test_id,
-        "User",
-    )?;
+    let mut qb = push_update(&payload, &req.version, &req.test_id, "User")?;
     let q = qb.build_query_scalar::<String>();
     let sql = q.sql();
     q.fetch_one(&mut *txn)
