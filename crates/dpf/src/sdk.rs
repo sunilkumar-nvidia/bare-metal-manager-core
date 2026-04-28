@@ -27,7 +27,8 @@ use sha2::{Digest, Sha256};
 
 use crate::crds::bfbs_generated::{BFB, BfbSpec};
 use crate::crds::dpudeployments_generated::{
-    DPUDeployment, DpuDeploymentDpus, DpuDeploymentDpusDpuSets,
+    DPUDeployment, DpuDeploymentDpus, DpuDeploymentDpusDpuSetStrategy,
+    DpuDeploymentDpusDpuSetStrategyType, DpuDeploymentDpusDpuSets,
     DpuDeploymentDpusDpuSetsNodeSelector, DpuDeploymentDpusNodeEffect, DpuDeploymentServiceChains,
     DpuDeploymentServiceChainsSwitches, DpuDeploymentServiceChainsSwitchesPorts,
     DpuDeploymentServiceChainsSwitchesPortsService,
@@ -647,6 +648,9 @@ pub fn build_deployment<L: ResourceLabeler>(
                             DpuDeploymentServicesDependsOn {
                                 name: FMDS_SERVICE_NAME.to_string(),
                             },
+                            DpuDeploymentServicesDependsOn {
+                                name: DOCA_HBN_SERVICE_NAME.to_string(),
+                            },
                         ])
                     } else {
                         None
@@ -736,6 +740,10 @@ pub fn build_deployment<L: ResourceLabeler>(
                     no_effect: None,
                     taint: None,
                 }),
+                dpu_set_strategy: Some(DpuDeploymentDpusDpuSetStrategy {
+                    rolling_update: None,
+                    r#type: Some(DpuDeploymentDpusDpuSetStrategyType::OnDelete),
+                }),
             },
             revision_history_limit: None,
             service_chains,
@@ -762,6 +770,7 @@ pub fn build_dpu_interfaces_vec() -> Vec<DpuServiceInterfaceTemplateDefinition> 
             chained_svc_if: Some(vec![
                 (DOCA_HBN_SERVICE_NAME.into(), "pf0hpf_if".into()),
                 (DHCP_SERVER_SERVICE_NAME.into(), "d_pf0hpf_if".into()),
+                (FMDS_SERVICE_NAME.into(), "f_pf0hpf_if".into()),
             ]),
         },
         DpuServiceInterfaceTemplateDefinition {

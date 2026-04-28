@@ -28,10 +28,13 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use carbide_ipmi::IPMITool;
+use carbide_nvlink_manager::NvlPartitionMonitor;
+use carbide_nvlink_manager::config::NvLinkConfig;
+use carbide_nvlink_manager::nvlink::NmxmClientPool;
+use carbide_nvlink_manager::nvlink::test_support::NmxmSimClient;
 use carbide_redfish::libredfish::test_support::RedfishSim;
-use carbide_redfish::nv_redfish::NvRedfishClientPool;
+use carbide_site_explorer::SiteExplorer;
 use carbide_site_explorer::config::{SiteExplorerConfig, SiteExplorerExploreMode};
-use carbide_site_explorer::{BmcEndpointExplorer, SiteExplorer};
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
 use carbide_uuid::machine::MachineId;
@@ -96,10 +99,9 @@ use crate::cfg::file::{
     IBFabricConfig, IbFabricDefinition, IbPartitionStateControllerConfig, ListenMode,
     MachineStateControllerConfig, MachineUpdater, MachineValidationConfig,
     MeasuredBootMetricsCollectorConfig, MqttAuthConfig, NetworkSecurityGroupConfig,
-    NetworkSegmentStateControllerConfig, NvLinkConfig, PowerManagerOptions,
-    PowerShelfStateControllerConfig, RackStateControllerConfig, SpdmConfig,
-    SpdmStateControllerConfig, StateControllerConfig, SwitchStateControllerConfig, VmaasConfig,
-    VpcPeeringPolicy, default_max_find_by_ids,
+    NetworkSegmentStateControllerConfig, PowerManagerOptions, PowerShelfStateControllerConfig,
+    RackStateControllerConfig, SpdmConfig, SpdmStateControllerConfig, StateControllerConfig,
+    SwitchStateControllerConfig, VmaasConfig, VpcPeeringPolicy, default_max_find_by_ids,
 };
 use crate::dpf::DpfOperations;
 use crate::ethernet_virtualization::{EthVirtData, SiteFabricPrefixList};
@@ -107,9 +109,6 @@ use crate::ib::{self, IBFabricManagerImpl, IBFabricManagerType};
 use crate::ib_fabric_monitor::IbFabricMonitor;
 use crate::logging::level_filter::ActiveLevel;
 use crate::logging::log_limiter::LogLimiter;
-use crate::nvl_partition_monitor::NvlPartitionMonitor;
-use crate::nvlink::NmxmClientPool;
-use crate::nvlink::test_support::NmxmSimClient;
 use crate::rack::rms_client::test_support::RmsSim;
 use crate::scout_stream;
 use crate::state_controller::common_services::CommonStateHandlerServices;
@@ -408,7 +407,9 @@ impl TestEnv {
             ManagedHostState::HostInit { machine_state } => {
                 let mc = match machine_state {
                     model::machine::MachineState::Init => machine_state,
-                    model::machine::MachineState::WaitingForPlatformConfiguration => machine_state,
+                    model::machine::MachineState::WaitingForPlatformConfiguration { .. } => {
+                        machine_state
+                    }
                     model::machine::MachineState::PollingBiosSetup => machine_state,
                     model::machine::MachineState::SetBootOrder { .. } => machine_state,
                     model::machine::MachineState::UefiSetup { .. } => machine_state,
@@ -418,6 +419,7 @@ impl TestEnv {
                     model::machine::MachineState::Measuring { .. } => machine_state,
 
                     model::machine::MachineState::EnableIpmiOverLan => machine_state,
+                    model::machine::MachineState::WaitingForBiosJob { .. } => machine_state,
                 };
                 ManagedHostState::HostInit { machine_state: mc }
             }
@@ -1479,15 +1481,15 @@ pub async fn create_test_env_with_overrides(
     };
 
     let bmc_proxy = Arc::new(ArcSwap::new(None.into()));
-    let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
+    let bmc_explorer = carbide_site_explorer::new_bmc_explorer(
         redfish_sim.clone(),
-        Arc::new(NvRedfishClientPool::new(bmc_proxy)),
+        carbide_redfish::nv_redfish::new_pool(bmc_proxy),
         carbide_ipmi::test_support(),
         composite_manager.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Tests use MockEndpointExplorer. So this doesn't affect anything.
         SiteExplorerExploreMode::NvRedfish,
-    ));
+    );
 
     let reachability_params = ReachabilityParams {
         dpu_wait_time: Duration::seconds(0),
@@ -2284,11 +2286,11 @@ pub async fn simulate_hardware_health_report(
         .unwrap();
 }
 
-/// Send a health report override
-pub async fn send_health_report_override(
+/// Send a health report entry
+pub async fn send_health_report_entry(
     env: &TestEnv,
     machine_id: &MachineId,
-    r#override: (HealthReport, HealthReportApplyMode),
+    entry: (HealthReport, HealthReportApplyMode),
 ) {
     use rpc::forge::forge_server::Forge;
     use tonic::Request;
@@ -2297,16 +2299,16 @@ pub async fn send_health_report_override(
         .insert_health_report_override(Request::new(InsertHealthReportOverrideRequest {
             machine_id: Some(*machine_id),
             health_report_entry: Some(HealthReportEntry {
-                report: Some(r#override.0.into()),
-                mode: r#override.1 as i32,
+                report: Some(entry.0.into()),
+                mode: entry.1 as i32,
             }),
         }))
         .await
         .unwrap();
 }
 
-/// Remove a health report override
-pub async fn remove_health_report_override(env: &TestEnv, machine_id: &MachineId, source: String) {
+/// Remove a health report entry
+pub async fn remove_health_report_entry(env: &TestEnv, machine_id: &MachineId, source: String) {
     use rpc::forge::forge_server::Forge;
     use tonic::Request;
     let _ = env

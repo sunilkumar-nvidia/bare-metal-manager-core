@@ -23,10 +23,12 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use carbide_firmware::FirmwareDownloader;
 use carbide_ipmi::IPMITool;
+use carbide_nvlink_manager::NvlPartitionMonitor;
+use carbide_nvlink_manager::nvlink::{NmxmClientPool, NmxmClientPoolImpl};
 use carbide_preingestion_manager::PreingestionManager;
 use carbide_redfish::libredfish::RedfishClientPool;
 use carbide_redfish::nv_redfish::NvRedfishClientPool;
-use carbide_site_explorer::{BmcEndpointExplorer, SiteExplorer};
+use carbide_site_explorer::SiteExplorer;
 use db::machine::update_dpu_asns;
 use db::resource_pool::DefineResourcePoolError;
 use db::{Transaction, work_lock_manager};
@@ -46,6 +48,7 @@ use model::route_server::RouteServerSourceType;
 use opentelemetry::metrics::Meter;
 use sqlx::postgres::PgSslMode;
 use sqlx::{ConnectOptions, PgPool};
+use sqlx_query_tracing::SQLX_STATEMENTS_LOG_LEVEL;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinSet;
@@ -67,12 +70,9 @@ use crate::logging::log_limiter::LogLimiter;
 use crate::logging::service_health_metrics::{
     ServiceHealthContext, start_export_service_health_metrics,
 };
-use crate::logging::sqlx_query_tracing::SQLX_STATEMENTS_LOG_LEVEL;
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::measured_boot::metrics_collector::MeasuredBootMetricsCollector;
 use crate::mqtt_state_change_hook::hook::MqttStateChangeHook;
-use crate::nvl_partition_monitor::NvlPartitionMonitor;
-use crate::nvlink::{NmxmClientPool, NmxmClientPoolImpl};
 use crate::rack::bms_client::BmsDsxExchangeHandle;
 use crate::scout_stream::ConnectionRegistry;
 use crate::state_controller::common_services::CommonStateHandlerServices;
@@ -377,7 +377,7 @@ pub async fn start_api(
         ListenMode::PlaintextHttp2 => ApiListenMode::PlaintextHttp2,
     };
 
-    let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
+    let bmc_explorer = carbide_site_explorer::new_bmc_explorer(
         shared_redfish_pool.clone(),
         shared_nv_redfish_pool,
         ipmi_tool.clone(),
@@ -387,7 +387,7 @@ pub async fn start_api(
             .rotate_switch_nvos_credentials
             .clone(),
         carbide_config.site_explorer.explore_mode,
-    ));
+    );
 
     let nvlink_config = carbide_config.nvlink_config.clone().unwrap_or_default();
 
@@ -407,18 +407,15 @@ pub async fn start_api(
 
         let provider = crate::dpf::CarbideBmcPasswordProvider::new(credential_manager.clone());
 
-        let services = vec![carbide_dpf::services::dts_service(
-            &carbide_dpf::services::ServiceRegistryConfig::default(),
-        )];
-        let reg = crate::dpf_services::CarbideServiceRegistryConfig::default();
+        let mandatory_services = carbide_config.dpf.services.clone();
+        let services = vec![crate::dpf_services::dts_service(&mandatory_services.dts)];
         let v2_services = vec![
-            carbide_dpf::services::dts_service(
-                &carbide_dpf::services::ServiceRegistryConfig::default(),
-            ),
-            crate::dpf_services::dhcp_server_service(&reg),
-            crate::dpf_services::doca_hbn_service(&reg),
-            crate::dpf_services::dpu_agent_service(&reg),
-            crate::dpf_services::fmds_service(&reg),
+            crate::dpf_services::dts_service(&mandatory_services.dts),
+            crate::dpf_services::doca_hbn_service(&mandatory_services.doca_hbn),
+            crate::dpf_services::dhcp_server_service(&mandatory_services.dhcp_server),
+            crate::dpf_services::dpu_agent_service(&mandatory_services.dpu_agent),
+            crate::dpf_services::fmds_service(&mandatory_services.fmds),
+            // crate::dpf_services::otel_service(&mandatory_services.otel),
         ];
 
         let bfcfg_template = if carbide_config.dpf.bfcfg_enabled {
