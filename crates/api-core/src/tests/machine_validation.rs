@@ -1641,6 +1641,102 @@ async fn test_machine_validation_m1_persists_selected_test_and_idempotent_result
     assert_eq!(running_attempts[0].state.to_string(), "Running");
     assert!(running_attempts[0].last_heartbeat_at.is_some());
 
+    let attempt_id = run_items[0]
+        .current_attempt_id
+        .clone()
+        .expect("run item should have an attempt");
+    let first_log_chunk = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 1,
+                stream: "stdout".to_string(),
+                content: "starting validation\n".to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(first_log_chunk.accepted);
+    assert!(!first_log_chunk.truncated);
+
+    let second_log_chunk = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 2,
+                stream: "stderr".to_string(),
+                content: "minor warning\n".to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(second_log_chunk.accepted);
+
+    // Retrying the same chunk is safe, but a gap in the ordered stream is not.
+    let retry = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 1,
+                stream: "stdout".to_string(),
+                content: "starting validation\n".to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(retry.accepted);
+    let gap = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(attempt_id.clone()),
+                sequence: 4,
+                stream: "stdout".to_string(),
+                content: "out of order\n".to_string(),
+            },
+        ))
+        .await;
+    assert_eq!(
+        gap.expect_err("gapped sequence should fail").code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let first_page = env
+        .api
+        .get_machine_validation_attempt_logs(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogGetRequest {
+                attempt_id: Some(attempt_id.clone()),
+                after_sequence: 0,
+                limit: 1,
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(first_page.has_more);
+    assert_eq!(first_page.chunks.len(), 1);
+    assert_eq!(first_page.chunks[0].sequence, 1);
+    assert_eq!(first_page.chunks[0].stream, "stdout");
+    assert_eq!(first_page.chunks[0].content, "starting validation\n");
+
+    let second_page = env
+        .api
+        .get_machine_validation_attempt_logs(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogGetRequest {
+                attempt_id: Some(attempt_id.clone()),
+                after_sequence: 1,
+                limit: 1,
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(!second_page.has_more);
+    assert_eq!(second_page.chunks.len(), 1);
+    assert_eq!(second_page.chunks[0].sequence, 2);
+    assert_eq!(second_page.chunks[0].stream, "stderr");
+
     let terminal_result = rpc::forge::MachineValidationResult {
         validation_id: Some(validation_id),
         name: selected_test.name.clone(),
@@ -1662,6 +1758,42 @@ async fn test_machine_validation_m1_persists_selected_test_and_idempotent_result
             },
         ))
         .await?;
+
+    let late_log_chunk = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(attempt_id),
+                sequence: 3,
+                stream: "stdout".to_string(),
+                content: "too late\n".to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(!late_log_chunk.accepted);
+    assert!(!late_log_chunk.truncated);
+
+    // A delivery retry can arrive after result persistence; it must not turn a
+    // known, persisted chunk into a failed delivery.
+    let terminal_retry = env
+        .api
+        .append_machine_validation_attempt_log(tonic::Request::new(
+            rpc::forge::MachineValidationAttemptLogAppendRequest {
+                attempt_id: Some(
+                    run_items[0]
+                        .current_attempt_id
+                        .clone()
+                        .expect("run item should have an attempt"),
+                ),
+                sequence: 2,
+                stream: "stderr".to_string(),
+                content: "minor warning\n".to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(terminal_retry.accepted);
 
     let previous_run_heartbeat =
         db::machine_validation::find_by_id(&env.pool, &validation_id).await?;

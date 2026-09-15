@@ -21,8 +21,9 @@ use carbide_uuid::machine_validation::{
 };
 use chrono::{DateTime, Utc};
 use model::machine_validation::{
-    MachineValidationAttempt, MachineValidationAttemptState, MachineValidationResult,
-    MachineValidationRunItem, MachineValidationRunItemState, MachineValidationTest,
+    MachineValidationAttempt, MachineValidationAttemptLogChunk, MachineValidationAttemptLogStream,
+    MachineValidationAttemptState, MachineValidationResult, MachineValidationRunItem,
+    MachineValidationRunItemState, MachineValidationTest,
 };
 use sqlx::PgConnection;
 
@@ -34,6 +35,16 @@ const DEFAULT_TIMEOUT_SECONDS: i64 = 7200;
 // Retry-aware events will need to carry attempt identity before this can vary.
 const INITIAL_ATTEMPT_NUMBER: i32 = 1;
 const SUMMARY_LIMIT: usize = 4096;
+/// Logs are persisted for operator diagnosis, not as an unbounded output sink.
+pub const MAX_ATTEMPT_LOG_BYTES: usize = 1024 * 1024;
+pub const MAX_ATTEMPT_LOG_CHUNK_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendMachineValidationAttemptLogResult {
+    Accepted,
+    Inactive,
+    Truncated,
+}
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct StaleMachineValidationAttempt {
@@ -175,6 +186,143 @@ pub async fn find_attempts_by_run_item_id(
 
     sqlx::query_as::<_, MachineValidationAttempt>(QUERY)
         .bind(run_item_id)
+        .fetch_all(txn)
+        .await
+        .map_err(|e| DatabaseError::query(QUERY, e))
+}
+
+/// Appends the next log chunk for an active attempt.
+///
+/// Locking the attempt row serializes appenders with terminal result updates and
+/// makes the per-attempt byte limit reliable even when a client retries.
+pub async fn append_attempt_log_chunk(
+    txn: &mut PgConnection,
+    attempt_id: &MachineValidationAttemptId,
+    sequence: i32,
+    stream: &MachineValidationAttemptLogStream,
+    content: &str,
+) -> DatabaseResult<AppendMachineValidationAttemptLogResult> {
+    if sequence <= 0 {
+        return Err(DatabaseError::InvalidArgument(
+            "machine validation attempt log sequence must be greater than zero".to_string(),
+        ));
+    }
+    if content.is_empty() {
+        return Err(DatabaseError::InvalidArgument(
+            "machine validation attempt log content must not be empty".to_string(),
+        ));
+    }
+    if content.len() > MAX_ATTEMPT_LOG_CHUNK_BYTES {
+        return Err(DatabaseError::InvalidArgument(format!(
+            "machine validation attempt log chunk exceeds {MAX_ATTEMPT_LOG_CHUNK_BYTES} bytes"
+        )));
+    }
+
+    const LOCK_ATTEMPT: &str = "
+        SELECT state
+        FROM machine_validation_attempts
+        WHERE id=$1
+        FOR UPDATE";
+    let attempt_state = sqlx::query_scalar::<_, String>(LOCK_ATTEMPT)
+        .bind(attempt_id)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(LOCK_ATTEMPT, e))?;
+    let Some(attempt_state) = attempt_state else {
+        return Ok(AppendMachineValidationAttemptLogResult::Inactive);
+    };
+
+    const FIND_EXISTING: &str = "
+        SELECT stream, content
+        FROM machine_validation_attempt_logs
+        WHERE attempt_id=$1 AND sequence=$2";
+    let existing = sqlx::query_as::<_, (String, String)>(FIND_EXISTING)
+        .bind(attempt_id)
+        .bind(sequence)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(FIND_EXISTING, e))?;
+    if let Some((existing_stream, existing_content)) = existing {
+        if existing_stream == stream.to_string() && existing_content == content {
+            return Ok(AppendMachineValidationAttemptLogResult::Accepted);
+        }
+        return Err(DatabaseError::InvalidArgument(
+            "machine validation attempt log sequence was already used by a different chunk"
+                .to_string(),
+        ));
+    }
+
+    if !matches!(attempt_state.as_str(), "Pending" | "Running") {
+        return Ok(AppendMachineValidationAttemptLogResult::Inactive);
+    }
+
+    const LAST_SEQUENCE: &str = "
+        SELECT MAX(sequence)
+        FROM machine_validation_attempt_logs
+        WHERE attempt_id=$1";
+    let last_sequence = sqlx::query_scalar::<_, Option<i32>>(LAST_SEQUENCE)
+        .bind(attempt_id)
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(LAST_SEQUENCE, e))?
+        .unwrap_or(0);
+    if sequence != last_sequence + 1 {
+        return Err(DatabaseError::InvalidArgument(format!(
+            "machine validation attempt log sequence must follow {last_sequence}"
+        )));
+    }
+
+    const CURRENT_LOG_BYTES: &str = "
+        SELECT COALESCE(SUM(octet_length(content)), 0)
+        FROM machine_validation_attempt_logs
+        WHERE attempt_id=$1";
+    let current_bytes = sqlx::query_scalar::<_, i64>(CURRENT_LOG_BYTES)
+        .bind(attempt_id)
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(CURRENT_LOG_BYTES, e))?;
+    let content_bytes = i64::try_from(content.len()).map_err(|_| {
+        DatabaseError::InvalidArgument(
+            "machine validation attempt log chunk is too large".to_string(),
+        )
+    })?;
+    let max_bytes = i64::try_from(MAX_ATTEMPT_LOG_BYTES).expect("log limit fits in i64");
+    if current_bytes + content_bytes > max_bytes {
+        return Ok(AppendMachineValidationAttemptLogResult::Truncated);
+    }
+
+    const INSERT: &str = "
+        INSERT INTO machine_validation_attempt_logs (attempt_id, sequence, stream, content)
+        VALUES ($1, $2, $3, $4)";
+    sqlx::query(INSERT)
+        .bind(attempt_id)
+        .bind(sequence)
+        .bind(stream.to_string())
+        .bind(content)
+        .execute(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(INSERT, e))?;
+
+    Ok(AppendMachineValidationAttemptLogResult::Accepted)
+}
+
+pub async fn find_attempt_log_chunks(
+    txn: impl DbReader<'_>,
+    attempt_id: &MachineValidationAttemptId,
+    after_sequence: i32,
+    limit: i32,
+) -> DatabaseResult<Vec<MachineValidationAttemptLogChunk>> {
+    const QUERY: &str = "
+        SELECT attempt_id, sequence, stream, created_at, content
+        FROM machine_validation_attempt_logs
+        WHERE attempt_id=$1 AND sequence > $2
+        ORDER BY sequence
+        LIMIT $3";
+
+    sqlx::query_as::<_, MachineValidationAttemptLogChunk>(QUERY)
+        .bind(attempt_id)
+        .bind(after_sequence)
+        .bind(limit)
         .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::query(QUERY, e))

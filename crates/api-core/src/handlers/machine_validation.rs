@@ -27,8 +27,9 @@ use model::machine::{
     ManagedHostState, ValidationState,
 };
 use model::machine_validation::{
-    MachineValidation, MachineValidationPlugin, MachineValidationResult, MachineValidationState,
-    MachineValidationStatus, MachineValidationTest as ModelMachineValidationTest,
+    MachineValidation, MachineValidationAttemptLogStream, MachineValidationPlugin,
+    MachineValidationResult, MachineValidationState, MachineValidationStatus,
+    MachineValidationTest as ModelMachineValidationTest,
     MachineValidationTestAddRequest as ModelTestAddRequest,
     MachineValidationTestUpdateRequest as ModelTestUpdateRequest,
     MachineValidationTestsGetRequest as ModelTestsGetRequest,
@@ -602,6 +603,120 @@ pub(crate) async fn get_machine_validation_attempt(
     Ok(tonic::Response::new(rpc::MachineValidationAttempt::from(
         attempt,
     )))
+}
+
+pub(crate) async fn append_machine_validation_attempt_log(
+    api: &Api,
+    request: tonic::Request<rpc::MachineValidationAttemptLogAppendRequest>,
+) -> Result<tonic::Response<rpc::MachineValidationAttemptLogAppendResponse>, Status> {
+    // Do not call log_request_data here: plugin output may contain sensitive values.
+    let req = request.into_inner();
+    let attempt_id = req
+        .attempt_id
+        .as_ref()
+        .ok_or(CarbideError::MissingArgument("attempt id"))?;
+    let attempt_id = MachineValidationAttemptId::from(
+        uuid::Uuid::try_from(attempt_id).map_err(CarbideError::from)?,
+    );
+    let sequence = i32::try_from(req.sequence).map_err(|_| {
+        CarbideError::InvalidArgument(
+            "machine validation attempt log sequence is too large".to_string(),
+        )
+    })?;
+    let stream = req
+        .stream
+        .parse::<MachineValidationAttemptLogStream>()
+        .map_err(|_| {
+            CarbideError::InvalidArgument(
+                "machine validation attempt log stream must be stdout or stderr".to_string(),
+            )
+        })?;
+
+    let mut txn = api.txn_begin().await?;
+    let result = db::machine_validation_execution::append_attempt_log_chunk(
+        &mut txn,
+        &attempt_id,
+        sequence,
+        &stream,
+        &req.content,
+    )
+    .await?;
+    txn.commit().await?;
+
+    let response = match result {
+        db::machine_validation_execution::AppendMachineValidationAttemptLogResult::Accepted => {
+            rpc::MachineValidationAttemptLogAppendResponse {
+                accepted: true,
+                truncated: false,
+            }
+        }
+        db::machine_validation_execution::AppendMachineValidationAttemptLogResult::Inactive => {
+            rpc::MachineValidationAttemptLogAppendResponse {
+                accepted: false,
+                truncated: false,
+            }
+        }
+        db::machine_validation_execution::AppendMachineValidationAttemptLogResult::Truncated => {
+            rpc::MachineValidationAttemptLogAppendResponse {
+                accepted: false,
+                truncated: true,
+            }
+        }
+    };
+    Ok(tonic::Response::new(response))
+}
+
+pub(crate) async fn get_machine_validation_attempt_logs(
+    api: &Api,
+    request: tonic::Request<rpc::MachineValidationAttemptLogGetRequest>,
+) -> Result<tonic::Response<rpc::MachineValidationAttemptLogList>, Status> {
+    log_request_data(&request);
+    const DEFAULT_LOG_PAGE_SIZE: u32 = 100;
+    const MAX_LOG_PAGE_SIZE: u32 = 100;
+
+    let req = request.into_inner();
+    let attempt_id = req
+        .attempt_id
+        .as_ref()
+        .ok_or(CarbideError::MissingArgument("attempt id"))?;
+    let attempt_id = MachineValidationAttemptId::from(
+        uuid::Uuid::try_from(attempt_id).map_err(CarbideError::from)?,
+    );
+    let limit = if req.limit == 0 {
+        DEFAULT_LOG_PAGE_SIZE
+    } else {
+        req.limit
+    };
+    if limit > MAX_LOG_PAGE_SIZE {
+        return Err(CarbideError::InvalidArgument(format!(
+            "machine validation attempt log limit must not exceed {MAX_LOG_PAGE_SIZE}"
+        ))
+        .into());
+    }
+    let after_sequence = i32::try_from(req.after_sequence).map_err(|_| {
+        CarbideError::InvalidArgument(
+            "machine validation attempt log after_sequence is too large".to_string(),
+        )
+    })?;
+    let database_limit = i32::try_from(limit + 1).expect("page size fits in i32");
+
+    // A missing attempt is different from an attempt with no output yet.
+    db::machine_validation_execution::find_attempt_by_id(&api.database_connection, &attempt_id)
+        .await?;
+    let mut chunks = db::machine_validation_execution::find_attempt_log_chunks(
+        &api.database_connection,
+        &attempt_id,
+        after_sequence,
+        database_limit,
+    )
+    .await?;
+    let has_more = chunks.len() > limit as usize;
+    chunks.truncate(limit as usize);
+
+    Ok(tonic::Response::new(rpc::MachineValidationAttemptLogList {
+        chunks: chunks.into_iter().map(Into::into).collect(),
+        has_more,
+    }))
 }
 
 pub(crate) async fn heartbeat_machine_validation_run(

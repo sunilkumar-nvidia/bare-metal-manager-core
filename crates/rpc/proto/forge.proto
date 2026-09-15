@@ -720,6 +720,12 @@ service Forge {
   // Machine-Validation attempt detail
   rpc GetMachineValidationAttempt(MachineValidationAttemptGetRequest) returns (MachineValidationAttempt);
 
+  // Append one ordered stdout or stderr chunk while an attempt is active.
+  rpc AppendMachineValidationAttemptLog(MachineValidationAttemptLogAppendRequest) returns (MachineValidationAttemptLogAppendResponse);
+
+  // Read persisted attempt logs after a sequence number.
+  rpc GetMachineValidationAttemptLogs(MachineValidationAttemptLogGetRequest) returns (MachineValidationAttemptLogList);
+
   // Machine-Validation run and active attempt heartbeat
   rpc HeartbeatMachineValidationRun(MachineValidationHeartbeatRequest) returns (MachineValidationHeartbeatResponse);
 
@@ -7427,6 +7433,43 @@ message MachineValidationAttempt {
   google.protobuf.Timestamp last_heartbeat_at = 13;
   optional string stdout_summary = 14;
   optional string stderr_summary = 15;
+}
+
+// One stdout or stderr chunk emitted by a running validation attempt. Sequence
+// numbers start at one and are assigned by the producer; timestamps are set by
+// the server when the chunk is accepted.
+message MachineValidationAttemptLogChunk {
+  common.UUID attempt_id = 1;
+  uint32 sequence = 2;
+  string stream = 3;
+  google.protobuf.Timestamp created_at = 4;
+  string content = 5;
+}
+
+message MachineValidationAttemptLogAppendRequest {
+  common.UUID attempt_id = 1;
+  uint32 sequence = 2;
+  string stream = 3;
+  string content = 4;
+}
+
+message MachineValidationAttemptLogAppendResponse {
+  // False when the attempt is no longer active or its log size limit is reached.
+  bool accepted = 1;
+  // True when the chunk was rejected because the per-attempt log limit was reached.
+  bool truncated = 2;
+}
+
+message MachineValidationAttemptLogGetRequest {
+  common.UUID attempt_id = 1;
+  // Return chunks with a sequence strictly greater than this value.
+  uint32 after_sequence = 2;
+  uint32 limit = 3;
+}
+
+message MachineValidationAttemptLogList {
+  repeated MachineValidationAttemptLogChunk chunks = 1;
+  bool has_more = 2;
 }
 
 message MachineValidationHeartbeatRequest {

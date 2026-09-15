@@ -20,11 +20,11 @@ use carbide_utils::none_if_empty::NoneIfEmpty;
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
 use model::machine_validation::{
-    MachineValidation, MachineValidationAttempt, MachineValidationExternalConfig,
-    MachineValidationPlugin, MachineValidationResult, MachineValidationRunItem,
-    MachineValidationState, MachineValidationTest, MachineValidationTestAddRequest,
-    MachineValidationTestUpdatePayload, MachineValidationTestUpdateRequest,
-    MachineValidationTestsGetRequest,
+    MachineValidation, MachineValidationAttempt, MachineValidationAttemptLogChunk,
+    MachineValidationExternalConfig, MachineValidationPlugin, MachineValidationResult,
+    MachineValidationRunItem, MachineValidationState, MachineValidationTest,
+    MachineValidationTestAddRequest, MachineValidationTestUpdatePayload,
+    MachineValidationTestUpdateRequest, MachineValidationTestsGetRequest,
 };
 
 use crate as rpc;
@@ -225,6 +225,20 @@ impl From<MachineValidationAttempt> for rpc::forge::MachineValidationAttempt {
             last_heartbeat_at: value.last_heartbeat_at.map(Into::into),
             stdout_summary: value.stdout_summary,
             stderr_summary: value.stderr_summary,
+        }
+    }
+}
+
+impl From<MachineValidationAttemptLogChunk> for rpc::forge::MachineValidationAttemptLogChunk {
+    fn from(value: MachineValidationAttemptLogChunk) -> Self {
+        rpc::forge::MachineValidationAttemptLogChunk {
+            attempt_id: Some(rpc::common::Uuid {
+                value: value.attempt_id.to_string(),
+            }),
+            sequence: value.sequence.try_into().unwrap_or(0),
+            stream: value.stream.to_string(),
+            created_at: Some(value.created_at.into()),
+            content: value.content,
         }
     }
 }

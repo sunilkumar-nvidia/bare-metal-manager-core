@@ -168,6 +168,24 @@ impl Display for MachineValidationAttemptState {
     }
 }
 
+/// The source stream for a persisted Machine Validation attempt log chunk.
+#[derive(Debug, Clone, PartialEq, Eq, strum_macros::EnumString)]
+pub enum MachineValidationAttemptLogStream {
+    #[strum(serialize = "stdout")]
+    Stdout,
+    #[strum(serialize = "stderr")]
+    Stderr,
+}
+
+impl Display for MachineValidationAttemptLogStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdout => f.write_str("stdout"),
+            Self::Stderr => f.write_str("stderr"),
+        }
+    }
+}
+
 fn decode_state<T>(raw: String, column: &'static str) -> Result<T, sqlx::Error>
 where
     T: FromStr,
@@ -327,6 +345,30 @@ impl<'r> FromRow<'r, PgRow> for MachineValidationAttempt {
             last_heartbeat_at: row.try_get("last_heartbeat_at")?,
             stdout_summary: row.try_get("stdout_summary")?,
             stderr_summary: row.try_get("stderr_summary")?,
+        })
+    }
+}
+
+/// A bounded, append-only stdout or stderr fragment from a validation attempt.
+#[derive(Debug, Clone)]
+pub struct MachineValidationAttemptLogChunk {
+    pub attempt_id: MachineValidationAttemptId,
+    pub sequence: i32,
+    pub stream: MachineValidationAttemptLogStream,
+    pub created_at: DateTime<Utc>,
+    pub content: String,
+}
+
+impl<'r> FromRow<'r, PgRow> for MachineValidationAttemptLogChunk {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let stream_raw: String = row.try_get("stream")?;
+
+        Ok(MachineValidationAttemptLogChunk {
+            attempt_id: row.try_get("attempt_id")?,
+            sequence: row.try_get("sequence")?,
+            stream: decode_state(stream_raw, "machine_validation_attempt_logs.stream")?,
+            created_at: row.try_get("created_at")?,
+            content: row.try_get("content")?,
         })
     }
 }
