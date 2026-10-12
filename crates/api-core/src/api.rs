@@ -600,6 +600,42 @@ impl Forge for Api {
         crate::handlers::network_segment::find_state_histories(self, request).await
     }
 
+    async fn list_external_validation_holds(
+        &self,
+        _request: Request<rpc::ListExternalValidationHoldsRequest>,
+    ) -> Result<Response<rpc::ListExternalValidationHoldsResponse>, Status> {
+        Err(Status::unimplemented(
+            "external validation holds are not implemented",
+        ))
+    }
+
+    async fn start_external_validation(
+        &self,
+        _request: Request<rpc::StartExternalValidationRequest>,
+    ) -> Result<Response<rpc::StartExternalValidationResponse>, Status> {
+        Err(Status::unimplemented(
+            "external validation attempts are not implemented",
+        ))
+    }
+
+    async fn cancel_external_validation(
+        &self,
+        _request: Request<rpc::CancelExternalValidationRequest>,
+    ) -> Result<Response<rpc::ExternalValidationAttempt>, Status> {
+        Err(Status::unimplemented(
+            "external validation attempts are not implemented",
+        ))
+    }
+
+    async fn complete_external_validation(
+        &self,
+        _request: Request<rpc::CompleteExternalValidationRequest>,
+    ) -> Result<Response<rpc::ExternalValidationAttempt>, Status> {
+        Err(Status::unimplemented(
+            "external validation attempts are not implemented",
+        ))
+    }
+
     async fn allocate_instance(
         &self,
         request: Request<rpc::InstanceAllocationRequest>,

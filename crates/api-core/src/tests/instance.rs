@@ -98,6 +98,62 @@ use crate::tests::common::api_fixtures::{
     TestEnv, TestManagedHost, create_managed_host_multi_dpu, create_managed_host_with_ek,
     remove_health_report_entry, send_health_report_entry, update_time_params,
 };
+
+#[crate::sqlx_test]
+async fn test_external_validation_binding_rejected_before_hydration(
+    _: PgPoolOptions,
+    options: PgConnectOptions,
+) {
+    let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
+    let env = create_test_env(pool).await;
+    // Hydration must not acquire a connection for an unsupported binding.
+    env.pool.close().await;
+
+    #[allow(deprecated)]
+    let legacy_request = rpc::InstanceAllocationRequest {
+        machine_id: Some(
+            "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                .parse()
+                .unwrap(),
+        ),
+        config: Some(rpc::InstanceConfig {
+            network: Some(rpc::forge::InstanceNetworkConfig {
+                auto: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bound_request = rpc::InstanceAllocationRequest {
+        external_validation_request_id: Some(uuid::Uuid::new_v4().to_string()),
+        ..legacy_request.clone()
+    };
+
+    for (scenario, batch) in [
+        ("single legacy allocation", false),
+        ("batch with an earlier unbound legacy allocation", true),
+    ] {
+        let error = if batch {
+            env.api
+                .allocate_instances(Request::new(rpc::forge::BatchInstanceAllocationRequest {
+                    instance_requests: vec![legacy_request.clone(), bound_request.clone()],
+                }))
+                .await
+                .unwrap_err()
+        } else {
+            env.api
+                .allocate_instance(Request::new(bound_request.clone()))
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{scenario}");
+        assert!(
+            error.message().contains("external validation allocation"),
+            "{scenario}"
+        );
+    }
+}
 use crate::tests::common::attestation::spdm_attestation_run_to_failed_then_to_success;
 use crate::tests::common::rpc_builder::{
     InstanceAllocationRequest, InstanceConfig, InstanceConfigExt, VpcCreationRequest,
@@ -429,6 +485,7 @@ async fn test_measurement_assigned_ready_to_waiting_for_measurements_to_ca_faile
             config: Some(instance_config),
             metadata: None,
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await
         .expect("Create instance failed.")
@@ -8199,6 +8256,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
                 instance_type_id: None,
                 metadata: Some(metadata("create", wire_vf_id)),
                 allow_unhealthy_machine: false,
+                external_validation_request_id: None,
             }))
             .await
             .expect_err("out-of-range wire VF must be rejected during instance creation");
@@ -8236,6 +8294,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
             instance_type_id: None,
             metadata: Some(metadata("create", 15)),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await
         .expect("VF15 must remain valid during instance creation");
@@ -8563,6 +8622,7 @@ async fn test_allocate_instance_rejects_networked_service_without_vpc_selection(
                 labels: vec![],
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await
         .expect_err("networked attachment without a VPC must be rejected");
@@ -9078,6 +9138,7 @@ async fn test_allocate_instance_with_extension_services_rejected_on_dpf_host(
                 labels: vec![],
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await
         .expect_err("extension services must be rejected on a DPF-managed host");
@@ -9255,6 +9316,7 @@ async fn test_allocate_instance_with_duplicate_extension_services(
                 labels: vec![],
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await;
     println!("instance: {:?}", instance);
@@ -10230,6 +10292,7 @@ async fn test_allocate_instance_with_invalid_os_image(
                 labels: vec![],
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await;
 
@@ -10293,6 +10356,7 @@ async fn test_allocate_instance_with_invalid_ib_partition(
                 labels: vec![],
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         }))
         .await;
 

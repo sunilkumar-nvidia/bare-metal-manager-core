@@ -8,6 +8,7 @@ package forge;
 import "common_nico.proto";
 import "console_log_nico.proto";
 import "dns_nico.proto";
+import "external_validation_nico.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
@@ -1237,6 +1238,19 @@ service Forge {
 
   // Secrets management
   rpc ReWrapSecrets(ReWrapSecretsRequest) returns (ReWrapSecretsResponse);
+
+  // External-validation contract only: these methods are not implemented until
+  // durable holds and attempts are delivered. Scope is the connected Core site
+  // and configured tenant_org_id. Existing mTLS and method authorization are
+  // required in addition to tenant-scoped checks; request IDs grant no permission.
+  // Lists active holds in (created_at, hold_id) ascending order before pagination.
+  rpc ListExternalValidationHolds(ListExternalValidationHoldsRequest) returns (ListExternalValidationHoldsResponse);
+  // Atomically opens one attempt or replays the attempt identified by the key.
+  rpc StartExternalValidation(StartExternalValidationRequest) returns (StartExternalValidationResponse);
+  // Cancels only a NotStarted allocation; Creating or Created must be reconciled.
+  rpc CancelExternalValidation(CancelExternalValidationRequest) returns (ExternalValidationAttempt);
+  // Records a result for the bound instance; never clears the hold immediately.
+  rpc CompleteExternalValidation(CompleteExternalValidationRequest) returns (ExternalValidationAttempt);
 }
 
 // Indicates the lifecycle state of a resource that is controlled by a state controller
@@ -3471,6 +3485,21 @@ message InstanceAllocationRequest {
 
   // Allow allocation on unhealthy machines
   bool allow_unhealthy_machine = 13;
+
+  // Opaque UUID returned by StartExternalValidation. Requires the exact held
+  // machine, config.tenant.tenant_organization_id matching the policy, and
+  // allow_unhealthy_machine=true. Bypasses only this workflow's hold; unrelated
+  // blocking health alerts and repair admission are rechecked at allocation commit.
+  // It is an allocation idempotency key, not an authorization token. Identical
+  // retries return the original instance, including a server-generated instance
+  // ID; changed accepted inputs return ALREADY_EXISTS. Creating returns UNAVAILABLE;
+  // recover through ListExternalValidationHolds or retry the same key and inputs.
+  // The binding must commit with the instance. Omission preserves ordinary allocation.
+  // Contract milestone: present values return FAILED_PRECONDITION until binding
+  // is implemented, including in batch requests. External validation uses only
+  // the single-instance AllocateInstance RPC; request-bound batch allocation is
+  // outside this contract.
+  optional string external_validation_request_id = 14;
 }
 
 // Batch instance allocation request
