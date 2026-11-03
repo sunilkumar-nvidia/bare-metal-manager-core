@@ -2,8 +2,16 @@
 
 {% block title %}Machine Validation Run {{ validation_id }}{% endblock %}
 
+{% block head %}<script src="/admin/static/machine_validation.js" defer></script>{% endblock %}
+
 {% block content %}
 <h1>Machine Validation Run {{ validation_id }}</h1>
+<p id="validation-refresh-status" role="status"></p>
+<div id="validation-live" data-url="/admin/machinevalidation/runs/{{ validation_id }}/live">
+{% include "validation_run_live.html" %}
+</div>
+<h2>Terminal Results</h2>
+<p>Results appear here after each test finishes.</p>
 <table class="sortable overview">
 	<thead>
 		<tr>

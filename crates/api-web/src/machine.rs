@@ -825,6 +825,10 @@ pub(super) struct ValidationRun {
     pub(super) start_time: String,
     pub(super) end_time: String,
     pub(super) machine_id: String,
+    pub(super) progress: String,
+    pub(super) current_test: String,
+    pub(super) current_attempt: String,
+    pub(super) active: bool,
 }
 
 impl From<forgerpc::Machine> for MachineDetail<'_> {
@@ -1205,38 +1209,14 @@ pub(super) async fn detail(
     }
 
     // Get validation results
-    let validation_request = tonic::Request::new(rpc::forge::MachineValidationRunListGetRequest {
-        machine_id: Some(machine_id),
-        include_history: false,
-    });
-
-    let validation_runs = match state
-        .get_machine_validation_runs(validation_request)
-        .await
-        .map(|response| response.into_inner())
-    {
-        Ok(results) => results
-            .runs
-            .into_iter()
-            .rev() // Show the most recent run first
-            .map(|vr| ValidationRun {
-                machine_id: vr.machine_id.map(|id| id.to_string()).unwrap_or_default(),
-                status:format!("{:?}", vr.status.unwrap_or_default().machine_validation_state.unwrap_or(
-                    rpc::forge::machine_validation_status::MachineValidationState::Completed(
-                        rpc::forge::machine_validation_status::MachineValidationCompleted::Success.into(),
-                    ),
-                )),
-                context: vr.context.unwrap_or_default(),
-                validation_id: vr.validation_id.unwrap_or_default().to_string(),
-                start_time: vr.start_time.unwrap_or_default().to_string(),
-                end_time: vr.end_time.map_or_else(|| "N/A".to_string(), |time| time.to_string()),
-            })
-            .collect(),
-        Err(err) => {
-            tracing::warn!(error = %err, %machine_id, "get_machine_validation_runs failed");
-            Vec::new() // Empty validation results on error
-        }
-    };
+    let validation_runs =
+        match super::machine_validation::fetch_run_views(&state, Some(machine_id)).await {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::warn!(error = %err, %machine_id, "get_machine_validation_runs failed");
+                Vec::new()
+            }
+        };
 
     display.validation_runs = validation_runs;
     display.action_status = ActionStatus::from_query(&params);

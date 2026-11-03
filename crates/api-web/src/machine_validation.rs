@@ -28,6 +28,10 @@ use rpc::forge::{self as forgerpc};
 
 use super::Base;
 use super::machine::ValidationRun;
+
+mod live;
+pub(super) use live::{attempt_logs, attempt_logs_json, fetch_run_views, snapshot};
+
 use super::pagination::{self, PageContext, PaginationParams};
 
 #[derive(Debug)]
@@ -112,6 +116,7 @@ struct ValidationResultDetailDisplay {
 struct ValidationResults {
     validation_id: MachineValidationId,
     validation_results: Vec<ValidationResult>,
+    panel: live::RunPanel,
 }
 
 #[derive(Template)]
@@ -207,6 +212,10 @@ pub(super) async fn results(
                 .into_response();
         }
     };
+    let panel = match live::load_panel(&state, validation_id).await {
+        Ok(panel) => panel,
+        Err(status) => return live::error_response(status),
+    };
     let request = tonic::Request::new(forgerpc::MachineValidationGetRequest {
         validation_id: Some(validation_id),
         include_history: false,
@@ -246,6 +255,7 @@ pub(super) async fn results(
     let tmpl = ValidationResults {
         validation_id,
         validation_results,
+        panel,
     };
 
     (StatusCode::OK, Html(tmpl.render().unwrap())).into_response()
@@ -386,37 +396,9 @@ pub(super) async fn runs(
     AxumState(state): AxumState<Arc<Api>>,
     Query(params): Query<PaginationParams>,
 ) -> Response {
-    let validation_request = tonic::Request::new(rpc::forge::MachineValidationRunListGetRequest {
-        machine_id: None,
-        include_history: false,
-    });
-
-    let validation_runs: Vec<ValidationRun> = match state
-        .get_machine_validation_runs(validation_request)
-        .await
-        .map(|response| response.into_inner())
-    {
-        Ok(results) => results
-            .runs
-            .into_iter()
-            .rev()
-            .map(|vr| ValidationRun {
-                machine_id: vr.machine_id.map(|id| id.to_string()).unwrap_or_default(),
-                status:format!("{:?}", vr.status.unwrap_or_default().machine_validation_state.unwrap_or(
-                    rpc::forge::machine_validation_status::MachineValidationState::Completed(
-                        rpc::forge::machine_validation_status::MachineValidationCompleted::Success.into(),
-                    ),
-                )),
-                context: vr.context.unwrap_or_default(),
-                validation_id: vr.validation_id.unwrap_or_default().to_string(),
-                start_time: vr.start_time.unwrap_or_default().to_string(),
-                end_time: vr.end_time.map_or_else(|| "N/A".to_string(), |time| time.to_string()),
-            })
-            .collect(),
-        Err(err) => {
-            tracing::warn!(error = %err,"get_machine_validation_runs failed");
-            Vec::new()
-        }
+    let validation_runs = match fetch_run_views(&state, None).await {
+        Ok(runs) => runs,
+        Err(status) => return live::error_response(status),
     };
 
     let (info, validation_runs) = pagination::paginate_vec(validation_runs, &params);

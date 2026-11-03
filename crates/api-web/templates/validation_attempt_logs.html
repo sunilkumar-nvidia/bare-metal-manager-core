@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Validation Attempt Logs{% endblock %}
+{% block head %}<script src="/admin/static/machine_validation.js" defer></script>{% endblock %}
+{% block content %}
+<h1>Validation Attempt {{ attempt_id }}</h1>
+<p>Diagnostic logs are separate from the terminal test result. Stored logs may be limited by site policy.</p>
+<div id="validation-logs" data-url="/admin/machinevalidation/attempts/{{ attempt_id }}/logs.json">
+    <p id="validation-log-status" role="status">Loading logs…</p>
+    <h2>stdout</h2><pre id="validation-stdout"></pre>
+    <h2>stderr</h2><pre id="validation-stderr"></pre>
+</div>
+{% endblock %}

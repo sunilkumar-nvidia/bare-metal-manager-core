@@ -1,0 +1,23 @@
+<section data-active="{{ panel.run.active }}">
+    <h2>Run Progress</h2>
+    <dl>
+        <dt>State</dt><dd data-field="state">{{ panel.run.status }}</dd>
+        <dt>Completed/Total</dt><dd data-field="progress">{{ panel.run.progress }}</dd>
+        <dt>Current Test</dt><dd data-field="current-test">{{ panel.run.current_test }}</dd>
+        <dt>Current Attempt</dt><dd data-field="current-attempt">{{ panel.run.current_attempt }}</dd>
+        <dt>End Time</dt><dd data-field="end-time">{{ panel.run.end_time }}</dd>
+    </dl>
+    <h2>Tests and Attempt History</h2>
+    <table class="overview">
+        <thead><tr><th>Test ID</th><th>State</th><th>Attempt</th><th>Attempt History and Logs</th></tr></thead>
+        <tbody>
+        {% for item in panel.items %}
+            <tr><td>{{ item.test_id }}</td><td>{{ item.state }}</td><td>{{ item.attempt }}</td><td>
+            {% for attempt in item.attempts %}
+                <a href="/admin/machinevalidation/attempts/{{ attempt.id }}/logs">Attempt {{ attempt.number }} ({{ attempt.state }}) — stdout/stderr</a><br>
+            {% endfor %}
+            </td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>

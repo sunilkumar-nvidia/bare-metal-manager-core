@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 
+{% block head %}<script src="/admin/static/machine_validation.js" defer></script>{% endblock %}
+
 {% block title %}{{ id }}{% endblock %}
 
 {% block content %}
@@ -526,16 +528,22 @@ Missing BMC Data
                 <th>Start Time</th>
                 <th>End Time</th>
                 <th>State</th>
+                <th>Completed/Total</th>
+                <th>Current Test</th>
+                <th>Current Attempt</th>
             </tr>
         </thead>
         <tbody>
             {% for run in validation_runs %}
-            <tr>
+            <tr data-validation-active="{{ run.active }}" data-validation-url="/admin/machinevalidation/runs/{{ run.validation_id }}/live">
                 <td><a href="/admin/machinevalidation/runs/{{ run.validation_id }}">{{ run.validation_id }}</a></td>
                 <td>{{ run.context }}</td>
                 <td>{{ run.start_time }}</td>
-                <td>{{ run.end_time }}</td>
-                <td>{% if run.status == "Completed(Success)" %}<span class="bubble success">{% else %}<span class="bubble error">{% endif %}{{ run.status }}</span></td>
+                <td data-field="end-time">{{ run.end_time }}</td>
+                <td data-field="state">{% if run.status == "Completed(Success)" %}<span class="bubble success">{% else %}<span class="bubble error">{% endif %}{{ run.status }}</span></td>
+                <td data-field="progress">{{ run.progress }}</td>
+                <td data-field="current-test">{{ run.current_test }}</td>
+                <td data-field="current-attempt">{{ run.current_attempt }}</td>
             </tr>
             {% endfor %}
         </tbody>

@@ -319,6 +319,7 @@ const ALLOWED_ACCESS_GROUPS_LIST_ENV: &str = "CARBIDE_WEB_ALLOWED_ACCESS_GROUPS"
 
 const ALLOWED_ACCESS_GROUPS_ID_LIST_ENV: &str = "CARBIDE_WEB_ALLOWED_ACCESS_GROUPS_ID_LIST";
 
+const MACHINE_VALIDATION_JS: &str = include_str!("../templates/static/machine_validation.js");
 const SORTABLE_JS: &str = include_str!("../templates/static/sortable.min.js");
 const SORTABLE_CSS: &str = include_str!("../templates/static/sortable.min.css");
 const CARBIDE_CSS: &str = include_str!("../templates/static/carbide.css");
@@ -917,6 +918,18 @@ fn routes_with_auth_mode(
             )
             .route(&format!("/{AUTH_CALLBACK_ROOT}"), get(auth::callback))
             .route(
+                "/machinevalidation/runs/{validation_id}/live",
+                get(machine_validation::snapshot),
+            )
+            .route(
+                "/machinevalidation/attempts/{attempt_id}/logs",
+                get(machine_validation::attempt_logs),
+            )
+            .route(
+                "/machinevalidation/attempts/{attempt_id}/logs.json",
+                get(machine_validation::attempt_logs_json),
+            )
+            .route(
                 "/machinevalidation/runs/{validation_id}",
                 get(machine_validation::results),
             )
@@ -972,6 +985,13 @@ async fn web_auth_middleware_fn(
             challenge,
         }) => {
             if basic_credentials_are_valid(&headers, password) {
+                req.extensions_mut()
+                    .get_or_insert_default::<AuthContext>()
+                    .principals
+                    .push(Principal::from_web_cookie(
+                        BASIC_AUTH_USERNAME.to_owned(),
+                        String::new(),
+                    ));
                 return Ok(next.run(req).await);
             }
             return Ok((StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, *challenge)]).into_response());
@@ -1185,6 +1205,38 @@ mod web_auth_tests {
     }
 
     #[tokio::test]
+    async fn machine_validation_basic_auth_forwards_an_admin_identity_to_core_handlers() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|Extension(context): Extension<AuthContext>| async move {
+                    assert!(
+                        context
+                            .principals
+                            .iter()
+                            .any(|principal| matches!(principal, Principal::ExternalUser(_)))
+                    );
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .layer(axum::middleware::from_fn(web_auth_middleware_fn))
+            .layer(Extension(Arc::new(WebAuth::basic(Some(
+                "secret".to_string(),
+            )))));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn valid_basic_credentials_reach_the_ui() {
         let response = auth_test_router(WebAuth::basic(Some("secret".to_string())))
             .oneshot(
@@ -1361,6 +1413,12 @@ async fn static_data(
     AxumPath(filename): AxumPath<String>,
 ) -> Response {
     match filename.as_str() {
+        "machine_validation.js" => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/javascript")],
+            MACHINE_VALIDATION_JS,
+        )
+            .into_response(),
         "sortable.js" => (
             StatusCode::OK,
             [(CONTENT_TYPE, "text/javascript")],
